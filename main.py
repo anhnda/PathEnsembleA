@@ -33,6 +33,9 @@ def parse_args():
     ap.add_argument("--rho", type=float, default=0.5, help="schedule-strength (0..1)")
     ap.add_argument("--grid", type=int, default=14, help="grid patch cho schedule group")
     ap.add_argument("--chunk", type=int, default=32, help="so anh moi mini-batch qua model (giam neu OOM)")
+    ap.add_argument("--baseline", type=str, default="black",
+                    choices=["black", "gaussian", "blur"],
+                    help="loai baseline; black hay bao hoa manh -> completeness gap lon")
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--antithetic", action="store_true")
@@ -90,9 +93,27 @@ def main():
 
     grad_fn = make_resnet50_gradfn(model, target, device, chunk=args.chunk)
 
-    # baseline pool: anh den, lap lai P lan (thay bang pool cua may neu muon)
-    base = black_baseline((C, H, W), device)          # (3, H, W)
-    baselines = base[None].repeat(args.P, 1, 1, 1)    # (P, 3, H, W)
+    # baseline pool
+    if args.baseline == "black":
+        base = black_baseline((C, H, W), device)          # (3, H, W)
+        baselines = base[None].repeat(args.P, 1, 1, 1)    # (P, 3, H, W)
+    elif args.baseline == "gaussian":
+        # nhieu gaussian quanh 0 trong khong gian da chuan hoa -> tranh diem bao hoa cua anh den
+        g2 = torch.Generator(device=device); g2.manual_seed(args.seed + 1)
+        baselines = torch.randn(args.P, C, H, W, generator=g2, device=device)
+    elif args.baseline == "blur":
+        # anh input lam mo manh lam baseline (cung pool, lap lai)
+        import torch.nn.functional as F
+        k = 31
+        coords = torch.arange(k, device=device) - k // 2
+        g1d = torch.exp(-(coords.float() ** 2) / (2 * (k / 3) ** 2))
+        g1d = (g1d / g1d.sum()).view(1, 1, -1)
+        xb = x[None]
+        xb = F.conv2d(xb, g1d.view(1, 1, 1, k).repeat(C, 1, 1, 1), padding=(0, k // 2), groups=C)
+        xb = F.conv2d(xb, g1d.view(1, 1, k, 1).repeat(C, 1, 1, 1), padding=(k // 2, 0), groups=C)
+        baselines = xb.repeat(args.P, 1, 1, 1)
+    else:
+        raise ValueError(args.baseline)
 
     # group map: grid x grid patch, share RGB
     gidx = make_patch_groups(C, H, W, grid=args.grid).to(device)

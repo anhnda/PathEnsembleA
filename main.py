@@ -113,6 +113,22 @@ def main():
         fx0 = model(baselines)[:, target].mean().item()
     pea_sum = phi_pea.sum().item()
 
+    # --- IG tham chieu doc lap (trapezoid, gom alpha=0 va alpha=1) de chan scale ---
+    # Dung dung 1 baseline dau tien; neu code chinh dung, so nay phai xap xi fx - f(x0_0).
+    x0_ref = baselines[0]
+    with torch.no_grad():
+        fx0_ref = model(x0_ref[None])[0, target].item()
+    alphas = torch.linspace(0, 1, args.T + 1, device=device)  # gom ca 2 dau
+    states_ref = x0_ref.unsqueeze(0) + alphas.view(-1, 1, 1, 1) * (x - x0_ref).unsqueeze(0)
+    grads_ref = grad_fn(states_ref)  # (T+1, 3, H, W)
+    # trapezoid theo alpha, roi nhan (x - x0)
+    avg_grad = 0.5 * (grads_ref[:-1] + grads_ref[1:]).mean(dim=0)  # trung binh trapezoid
+    ig_ref = (avg_grad * (x - x0_ref)).sum().item()
+    print("\n--- IG tham chieu (trapezoid, 1 baseline) ---")
+    print(f"IG_ref sum        = {ig_ref:.4f}")
+    print(f"f(x) - f(x0_0)    = {fx - fx0_ref:.4f}")
+    print(f"IG_ref resid      = {abs(ig_ref - (fx - fx0_ref)):.4f}  (neu nho -> loi o midpoint/PEA; neu lon -> loi o grad_fn)")
+
     print("\n=== KET QUA ===")
     print(f"sum(phi_PEA)      = {pea_sum:.4f}")
     print(f"f(x) - E[f(x0)]   = {fx - fx0:.4f}")

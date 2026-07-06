@@ -108,7 +108,7 @@ def main():
     C, H, W = x.shape
     P = args.pea_P
     reps = (P + baselines.shape[0] - 1) // baselines.shape[0]
-    pea_baselines = baselines.repeat(reps, 1, 1, 1)[:P]
+    pea_baselines = blur_baseline.repeat(reps, 1, 1, 1)[:P]
     gidx = make_patch_groups(C, H, W, grid=args.grid).to(device)
     T_pea = max(2, N // P)
     phi_pea, phi_tube, _ = path_ensemble_attribution(

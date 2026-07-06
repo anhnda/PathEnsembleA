@@ -20,6 +20,8 @@ import torch
 from pea.resnet50_gradfn import load_resnet50, make_resnet50_gradfn, preprocess, IMAGENET_MEAN, IMAGENET_STD
 from pea.insdel import insertion_deletion
 from pea.methods import ig_single, eg, sba, sba_d
+from pea.estimator import path_ensemble_attribution
+from pea.schedules import make_patch_groups
 
 
 def parse_args():
@@ -29,6 +31,10 @@ def parse_args():
     ap.add_argument("--N", type=int, default=500, help="ngan sach: so gradient eval/anh")
     ap.add_argument("--sba_sigma", type=float, default=0.3, help="do rong Brownian bridge cho SBA")
     ap.add_argument("--sba_P", type=int, default=4, help="so trajectory/baseline cho SBA")
+    ap.add_argument("--rho", type=float, default=0.2, help="schedule-strength cho PEA")
+    ap.add_argument("--grid", type=int, default=14, help="patch grid cho PEA")
+    ap.add_argument("--L", type=int, default=6, help="so mode cosine cho PEA")
+    ap.add_argument("--pea_P", type=int, default=25, help="so path cho PEA/Tube-EG")
     ap.add_argument("--chunk", type=int, default=16)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--seed", type=int, default=0)
@@ -93,6 +99,21 @@ def main():
     attrs["SBA"] = sba(x, baselines, grad_fn, N=N, sigma=args.sba_sigma, P=args.sba_P, gen=gen)
     # SBA-D barycentric + Ito
     attrs["SBA-D"] = sba_d(x, baselines, grad_fn, N=N, gen=gen)
+
+    # PEA + Tube-EG (cung pool baseline, cung ngan sach N)
+    # P path = pea_P; lap pool baseline cho du P; T = N // P de tong grad ~ N
+    C, H, W = x.shape
+    P = args.pea_P
+    reps = (P + baselines.shape[0] - 1) // baselines.shape[0]
+    pea_baselines = baselines.repeat(reps, 1, 1, 1)[:P]
+    gidx = make_patch_groups(C, H, W, grid=args.grid).to(device)
+    T_pea = max(2, N // P)
+    phi_pea, phi_tube, _ = path_ensemble_attribution(
+        x, pea_baselines, gidx, grad_fn, n_groups=args.grid * args.grid,
+        L=args.L, rho=args.rho, T=T_pea, generator=gen, log_geometry=False,
+    )
+    attrs["PEA"] = phi_pea
+    attrs["Tube-EG"] = phi_tube
 
     # insertion / deletion cho tung attribution
     print(f"{'method':<12}{'insertion↑':>12}{'deletion↓':>12}{'I-D↑':>10}")

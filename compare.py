@@ -88,6 +88,7 @@ def main():
 
     grad_fn = make_resnet50_gradfn(model, target, device, chunk=args.chunk, score=args.score)
     names, baselines = make_baselines(x, device, args.seed)
+    blur_baseline = baselines[-1]
     N = args.N
     print(f"[i] ngan sach N={N} gradient eval/anh, device={device}\n")
 
@@ -98,9 +99,9 @@ def main():
     # EG pool 4 baseline
     attrs["EG"] = eg(x, baselines, grad_fn, N=N)
     # SBA Brownian bridge + Ito
-    attrs["SBA"] = sba(x, baselines, grad_fn, N=N, sigma=args.sba_sigma, P=args.sba_P, gen=gen)
+    attrs["SBA"] = sba(x, blur_baseline, grad_fn, N=N, sigma=args.sba_sigma, P=args.sba_P, gen=gen)
     # SBA-D barycentric + Ito
-    attrs["SBA-D"] = sba_d(x, baselines, grad_fn, N=N, gen=gen)
+    attrs["SBA-D"] = sba_d(x, blur_baseline, grad_fn, N=N, gen=gen)
 
     # PEA + Tube-EG (cung pool baseline, cung ngan sach N)
     # P path = pea_P; lap pool baseline cho du P; T = N // P de tong grad ~ N

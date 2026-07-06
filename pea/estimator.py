@@ -47,7 +47,8 @@ GradFn = Callable[[torch.Tensor], torch.Tensor]
 """grad_fn(batch_states: (B, *input_shape)) -> (B, *input_shape) gradients of the scalar target."""
 
 
-@torch.no_grad()  # gradients come from grad_fn, which manages its own autograd internally
+# NOTE: KHONG boc @torch.no_grad() o day — grad_fn ben trong can autograd de backward.
+# Cac phep tinh noi suy/tich phan deu nam duoi torch.no_grad() cuc bo ben duoi.
 def path_ensemble_attribution(
     x: torch.Tensor,                 # (*input_shape) single input
     baselines: torch.Tensor,        # (P, *input_shape) one baseline per path (baseline pool sampled by you)
@@ -104,40 +105,42 @@ def path_ensemble_attribution(
     delta_full = None  # ||x - x0|| accumulator handled per path for excess length
 
     for p in range(P):
-        x0 = baselines[p].reshape(-1)  # (D,)
-        delta = x_flat - x0            # (D,)
-        a = coeffs[p]                  # (n_groups, L)
+        with torch.no_grad():
+            x0 = baselines[p].reshape(-1)  # (D,)
+            delta = x_flat - x0            # (D,)
+            a = coeffs[p]                  # (n_groups, L)
 
-        # schedule values on the whole grid: (T, n_groups)
-        s_grid = s_of_t(a, t_grid)
-        sdot_grid = sdot_of_t(a, t_grid)
-        # expand to coordinates: (T, D)
-        s_full = expand_groups(s_grid, group_index)
-        sdot_full = expand_groups(sdot_grid, group_index)
+            # schedule values on the whole grid: (T, n_groups)
+            s_grid = s_of_t(a, t_grid)
+            sdot_grid = sdot_of_t(a, t_grid)
+            # expand to coordinates: (T, D)
+            s_full = expand_groups(s_grid, group_index)
+            sdot_full = expand_groups(sdot_grid, group_index)
 
-        # interpolated states gamma_r : (T, D)  -> reshape to (T, *input_shape)
-        states = x0[None, :] + delta[None, :] * s_full
-        states_shaped = states.reshape(T, *input_shape)
+            # interpolated states gamma_r : (T, D)  -> reshape to (T, *input_shape)
+            states = x0[None, :] + delta[None, :] * s_full
+            states_shaped = states.reshape(T, *input_shape)
 
-        # single batched backward for all T midpoints
-        g = grad_fn(states_shaped).reshape(T, D)  # (T, D)
+        # grad_fn tu bat autograd ben trong (clone + requires_grad_), nen goi NGOAI no_grad
+        g = grad_fn(states_shaped).reshape(T, D)  # (T, D), da .detach()
 
-        gammadot = delta[None, :] * sdot_full  # (T, D)
+        with torch.no_grad():
+            gammadot = delta[None, :] * sdot_full  # (T, D)
 
-        # accumulate both estimators from the SAME g
-        phi_pea += (g * gammadot).sum(dim=0) * dt
-        phi_tube += (g * delta[None, :]).sum(dim=0) * dt
+            # accumulate both estimators from the SAME g
+            phi_pea += (g * gammadot).sum(dim=0) * dt
+            phi_tube += (g * delta[None, :]).sum(dim=0) * dt
 
-        if log_geometry:
-            m = x0[None, :] + delta[None, :] * t_grid[:, None]  # straight path (T, D)
-            dev = ((states - m) ** 2).sum(dim=1).mean() * 1.0  # approx int over t via mean
-            energy = ((gammadot - delta[None, :]) ** 2).sum(dim=1).mean()
-            length = gammadot.norm(dim=1).mean()  # approx int ||gammadot|| dt
-            straight_len = delta.norm()
-            geom.rms_deviation += float(dev)
-            geom.path_energy += float(energy)
-            geom.excess_length += float(length - straight_len)
-            geom.n += 1
+            if log_geometry:
+                m = x0[None, :] + delta[None, :] * t_grid[:, None]  # straight path (T, D)
+                dev = ((states - m) ** 2).sum(dim=1).mean() * 1.0  # approx int over t via mean
+                energy = ((gammadot - delta[None, :]) ** 2).sum(dim=1).mean()
+                length = gammadot.norm(dim=1).mean()  # approx int ||gammadot|| dt
+                straight_len = delta.norm()
+                geom.rms_deviation += float(dev)
+                geom.path_energy += float(energy)
+                geom.excess_length += float(length - straight_len)
+                geom.n += 1
 
     phi_pea /= P
     phi_tube /= P

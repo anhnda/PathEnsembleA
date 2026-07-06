@@ -22,7 +22,6 @@ import torch
 # ---------------------------------------------------------------------------
 # IG cho 1 baseline: phi = (x - x0) * mean_t grad(x0 + t (x-x0))
 # ---------------------------------------------------------------------------
-@torch.no_grad()
 def ig_single(x, x0, grad_fn, T):
     device = x.device
     alphas = ((torch.arange(T, device=device) + 0.5) / T).view(-1, 1, 1, 1)  # midpoint
@@ -34,7 +33,6 @@ def ig_single(x, x0, grad_fn, T):
 # ---------------------------------------------------------------------------
 # EG: trung binh IG tren pool baseline, chia ngan sach deu
 # ---------------------------------------------------------------------------
-@torch.no_grad()
 def eg(x, baselines, grad_fn, N):
     B = baselines.shape[0]
     T = max(1, N // B)
@@ -60,7 +58,6 @@ def _brownian_bridge(T, shape, sigma, device, gen):
     return sigma * BB              # (T+1, *shape)
 
 
-@torch.no_grad()
 def sba(x, baselines, grad_fn, N, sigma=0.3, P=1, gen=None):
     B = baselines.shape[0]
     T = max(2, N // (B * P))
@@ -89,7 +86,6 @@ def sba(x, baselines, grad_fn, N, sigma=0.3, P=1, gen=None):
 #   tai buoc k, Xbar_tk = (1-s_k)*x0_b + s_k*x, voi s_k tang dan (co the cong
 #   do lay trung binh cac baseline khac de mo phong coupling). Giu Ito nhu paper.
 # ---------------------------------------------------------------------------
-@torch.no_grad()
 def sba_d(x, baselines, grad_fn, N, gen=None):
     B = baselines.shape[0]
     K = max(2, N // B)

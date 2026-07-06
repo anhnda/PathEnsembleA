@@ -72,7 +72,7 @@ def path_ensemble_attribution(
     P (number of paths) = baselines.shape[0]. If antithetic=True, each sampled coeff set a
     is paired with -a; supply P even and coeffs are generated for P//2 pairs.
     """
-    device, dtype = x.device, x.dtype
+    device, dtype = x.device, x.dtype  # follows x; put x on cuda and everything runs on cuda
     input_shape = x.shape
     D = int(torch.tensor(input_shape).prod().item())
     P = baselines.shape[0]

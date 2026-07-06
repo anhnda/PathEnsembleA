@@ -105,8 +105,9 @@ def compute_attr(method, x, args, grad_fn, device, seed):
         b = make_single_baseline(x, args.baseline if args.baseline != "pool" else "blur", device, seed)
         return ig_single(x, b, grad_fn, T=args.N)
     if method in ("EG", "SBA", "SBA-D"):
-        baselines = (make_pool(x, device, seed) if args.baseline == "pool"
-                     else make_single_baseline(x, args.baseline, device, seed)[None])
+        baselines = make_pool(x, device, seed)
+        # baselines = (make_pool(x, device, seed) if args.baseline == "pool"
+        #              else make_single_baseline(x, args.baseline, device, seed)[None])
         if method == "EG":
             return eg(x, baselines, grad_fn, N=args.N)
         if method == "SBA":
@@ -115,8 +116,9 @@ def compute_attr(method, x, args, grad_fn, device, seed):
             return sba_d(x, baselines, grad_fn, N=args.N, gen=gen)
     if method in ("PEA", "Tube-EG"):
         C, H, W = x.shape
-        baselines = (make_pool(x, device, seed) if args.baseline == "pool"
-                     else make_single_baseline(x, args.baseline, device, seed)[None])
+        baselines = make_pool(x, device, seed)
+        # baselines = (make_pool(x, device, seed) if args.baseline == "pool"
+        #              else make_single_baseline(x, args.baseline, device, seed)[None])
         # dam bao du path = so baseline; lap lai neu can
         P = max(baselines.shape[0], 25)
         if baselines.shape[0] < P:

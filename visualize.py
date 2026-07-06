@@ -52,6 +52,8 @@ def parse_args():
     ap.add_argument("--cmap", type=str, default="jet")
     ap.add_argument("--percentile", type=float, default=99.0,
                     help="clip attribution o percentile nay de bo outlier khi to mau")
+    ap.add_argument("--score", type=str, default="logit", choices=["logit", "softmax"],
+                    help="score cho attribution backward")
     ap.add_argument("--out", type=str, default=None)
     return ap.parse_args()
 
@@ -178,7 +180,7 @@ def main():
         target = args.target
         print(f"[i] target = {target}")
 
-    grad_fn = make_resnet50_gradfn(model, target, device, chunk=args.chunk)
+    grad_fn = make_resnet50_gradfn(model, target, device, chunk=args.chunk, score=args.score)
     img_np = denorm(x)
 
     methods = ALL_METHODS if args.method == "all" else [args.method]

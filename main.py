@@ -37,6 +37,8 @@ def parse_args():
                     choices=["black", "gaussian", "blur"],
                     help="loai baseline; black hay bao hoa manh -> completeness gap lon")
     ap.add_argument("--insdel_steps", type=int, default=224, help="so buoc insertion/deletion")
+    ap.add_argument("--score", type=str, default="logit", choices=["logit", "softmax"],
+                    help="dung CHUNG cho attribution backward va metric")
     ap.add_argument("--substrate", type=str, default="blur", choices=["blur", "black"],
                     help="nen dung cho insertion/gia tri xoa cho deletion")
     ap.add_argument("--device", type=str, default="cuda")
@@ -94,7 +96,7 @@ def main():
         target = args.target
         print(f"[i] target (ep) = {target}")
 
-    grad_fn = make_resnet50_gradfn(model, target, device, chunk=args.chunk)
+    grad_fn = make_resnet50_gradfn(model, target, device, chunk=args.chunk, score=args.score)
 
     # baseline pool
     if args.baseline == "black":
@@ -169,10 +171,10 @@ def main():
     print(f"\n--- Insertion / Deletion (substrate={args.substrate}, steps={args.insdel_steps}) ---")
     res_pea = insertion_deletion(model, x, phi_pea, target, device=device,
                                  steps=args.insdel_steps, substrate=args.substrate,
-                                 batch=args.chunk)
+                                 batch=args.chunk, score=args.score)
     res_tube = insertion_deletion(model, x, phi_tube, target, device=device,
                                   steps=args.insdel_steps, substrate=args.substrate,
-                                  batch=args.chunk)
+                                  batch=args.chunk, score=args.score)
     print(f"{'method':<12}{'insertion↑':>12}{'deletion↓':>12}{'I-D gap↑':>12}")
     print(f"{'PEA':<12}{res_pea['insertion_auc']:>12.4f}"
           f"{res_pea['deletion_auc']:>12.4f}{res_pea['id_gap']:>12.4f}")

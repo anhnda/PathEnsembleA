@@ -38,6 +38,8 @@ def parse_args():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--insdel_steps", type=int, default=224)
     ap.add_argument("--substrate", type=str, default="blur", choices=["blur", "black"])
+    ap.add_argument("--score", type=str, default="logit", choices=["logit", "softmax"],
+                    help="dung CHUNG cho attribution backward va metric")
     ap.add_argument("--limit", type=int, default=None, help="chi chay N anh dau (debug)")
     return ap.parse_args()
 
@@ -114,7 +116,7 @@ def main():
                 target = model(x[None]).argmax(1).item()
         else:
             target = args.target
-        grad_fn = make_resnet50_gradfn(model, target, device, chunk=args.chunk)
+        grad_fn = make_resnet50_gradfn(model, target, device, chunk=args.chunk, score=args.score)
 
         attrs = attributions_for_image(x, grad_fn, args, device, args.seed)
         if metric_names is None:
@@ -126,7 +128,7 @@ def main():
         for m, a in attrs.items():
             r = insertion_deletion(model, x, a, target, device=device,
                                    steps=args.insdel_steps, substrate=args.substrate,
-                                   batch=args.chunk)
+                                   batch=args.chunk, score=args.score)
             acc[m]["ins"].append(r["insertion_auc"])
             acc[m]["del"].append(r["deletion_auc"])
             acc[m]["id"].append(r["id_gap"])

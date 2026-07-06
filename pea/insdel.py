@@ -46,10 +46,11 @@ def insertion_deletion(
     steps: int = 224,         # so buoc (moi buoc them/bot mot khoi pixel)
     substrate: str = "blur",  # 'blur' hoac 'black' cho nen insertion / gia tri xoa deletion
     batch: int = 32,
+    score: str = "softmax",   # 'softmax' -> prob target; 'logit' -> raw logit target (DUNG CHUNG voi attribution)
 ):
     """
     Tra ve dict: insertion_auc, deletion_auc, id_gap, insertion_curve, deletion_curve.
-    AUC tinh bang trung binh score (softmax target) tren cac buoc, thang [0,1].
+    AUC = trung binh score target tren cac buoc. score='softmax' -> [0,1]; 'logit' -> raw.
     """
     C, H, W = x.shape
     N = H * W
@@ -69,11 +70,14 @@ def insertion_deletion(
     pcts = torch.linspace(0, N, steps + 1, device=device).round().long()
 
     def score_of(imgs: torch.Tensor) -> torch.Tensor:
-        """imgs: (B, 3, H, W) -> (B,) softmax prob cua target."""
+        """imgs: (B, 3, H, W) -> (B,) score cua target theo co `score`."""
         outs = []
         for i in range(0, imgs.shape[0], batch):
             logit = model(imgs[i:i + batch])
-            outs.append(F.softmax(logit, dim=1)[:, target])
+            if score == "logit":
+                outs.append(logit[:, target])
+            else:
+                outs.append(F.softmax(logit, dim=1)[:, target])
         return torch.cat(outs)
 
     x_flat = x.reshape(C, N)

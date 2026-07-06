@@ -40,6 +40,8 @@ def parse_args():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--insdel_steps", type=int, default=224)
     ap.add_argument("--substrate", type=str, default="blur", choices=["blur", "black"])
+    ap.add_argument("--score", type=str, default="logit", choices=["logit", "softmax"],
+                    help="dung CHUNG cho attribution backward va metric")
     return ap.parse_args()
 
 
@@ -84,7 +86,7 @@ def main():
         target = args.target
         print(f"[i] target = {target}")
 
-    grad_fn = make_resnet50_gradfn(model, target, device, chunk=args.chunk)
+    grad_fn = make_resnet50_gradfn(model, target, device, chunk=args.chunk, score=args.score)
     names, baselines = make_baselines(x, device, args.seed)
     N = args.N
     print(f"[i] ngan sach N={N} gradient eval/anh, device={device}\n")
@@ -122,7 +124,7 @@ def main():
     for nm, a in attrs.items():
         r = insertion_deletion(model, x, a, target, device=device,
                                steps=args.insdel_steps, substrate=args.substrate,
-                               batch=args.chunk)
+                               batch=args.chunk, score=args.score)
         rows[nm] = r
         print(f"{nm:<12}{r['insertion_auc']:>12.4f}{r['deletion_auc']:>12.4f}{r['id_gap']:>10.4f}")
 

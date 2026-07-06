@@ -27,12 +27,16 @@ def load_resnet50(device: str = "cuda") -> torch.nn.Module:
 
 
 def make_resnet50_gradfn(model: torch.nn.Module, target: int, device: str = "cuda",
-                         chunk: int = 32):
+                         chunk: int = 32, score: str = "logit"):
     """
     target: chi so lop ImageNet (0..999) can giai thich.
     chunk : so anh moi mini-batch forward/backward (giam de tranh OOM).
+    score : 'logit' -> backward tren logit tho; 'softmax' -> backward tren log-softmax
+            (log prob) cua target. Dung CHUNG voi metric de nhat quan.
     Tra ve grad_fn dung cho path_ensemble_attribution.
     """
+    import torch.nn.functional as F
+
     def grad_fn(states: torch.Tensor) -> torch.Tensor:
         # states: (T, 3, H, W) — cac trang thai noi suy gamma_r
         T = states.shape[0]
@@ -40,10 +44,13 @@ def make_resnet50_gradfn(model: torch.nn.Module, target: int, device: str = "cud
         for i in range(0, T, chunk):
             sb = states[i:i + chunk].to(device).clone().requires_grad_(True)
             logits = model(sb)                       # (b, 1000)
-            score = logits[:, target].sum()          # grad tach roi theo hang
-            grad, = torch.autograd.grad(score, sb)   # (b, 3, H, W)
+            if score == "softmax":
+                s = F.log_softmax(logits, dim=1)[:, target].sum()
+            else:
+                s = logits[:, target].sum()
+            grad, = torch.autograd.grad(s, sb)       # (b, 3, H, W)
             out[i:i + chunk] = grad.detach()
-            del sb, logits, score, grad
+            del sb, logits, s, grad
         return out
     return grad_fn
 

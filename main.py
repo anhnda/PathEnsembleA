@@ -36,6 +36,9 @@ def parse_args():
     ap.add_argument("--baseline", type=str, default="black",
                     choices=["black", "gaussian", "blur"],
                     help="loai baseline; black hay bao hoa manh -> completeness gap lon")
+    ap.add_argument("--insdel_steps", type=int, default=224, help="so buoc insertion/deletion")
+    ap.add_argument("--substrate", type=str, default="blur", choices=["blur", "black"],
+                    help="nen dung cho insertion/gia tri xoa cho deletion")
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--antithetic", action="store_true")
@@ -161,9 +164,29 @@ def main():
     print(f"path energy     = {geom.path_energy:.6f}")
     print(f"excess length   = {geom.excess_length:.6f}")
 
+    # ---- Insertion / Deletion faithfulness cho PEA va Tube-EG ----
+    from pea.insdel import insertion_deletion
+    print(f"\n--- Insertion / Deletion (substrate={args.substrate}, steps={args.insdel_steps}) ---")
+    res_pea = insertion_deletion(model, x, phi_pea, target, device=device,
+                                 steps=args.insdel_steps, substrate=args.substrate,
+                                 batch=args.chunk)
+    res_tube = insertion_deletion(model, x, phi_tube, target, device=device,
+                                  steps=args.insdel_steps, substrate=args.substrate,
+                                  batch=args.chunk)
+    print(f"{'method':<12}{'insertion↑':>12}{'deletion↓':>12}{'I-D gap↑':>12}")
+    print(f"{'PEA':<12}{res_pea['insertion_auc']:>12.4f}"
+          f"{res_pea['deletion_auc']:>12.4f}{res_pea['id_gap']:>12.4f}")
+    print(f"{'Tube-EG':<12}{res_tube['insertion_auc']:>12.4f}"
+          f"{res_tube['deletion_auc']:>12.4f}{res_tube['id_gap']:>12.4f}")
+    dgap = res_pea['id_gap'] - res_tube['id_gap']
+    print(f"{'Δ(PEA-Tube)':<12}{'':>12}{'':>12}{dgap:>12.4f}"
+          f"   {'<- PEA tot hon neu >0' if dgap > 0 else '<- khong hon smoothing'}")
+
     torch.save(
         {"phi_pea": phi_pea.cpu(), "phi_tube": phi_tube.cpu(),
-         "target": target, "geom": vars(geom)},
+         "target": target, "geom": vars(geom),
+         "insdel_pea": {k: v for k, v in res_pea.items() if not k.endswith("curve")},
+         "insdel_tube": {k: v for k, v in res_tube.items() if not k.endswith("curve")}},
         args.out,
     )
     print(f"\n[i] da luu -> {args.out}")

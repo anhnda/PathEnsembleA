@@ -26,18 +26,25 @@ def load_resnet50(device: str = "cuda") -> torch.nn.Module:
     return model
 
 
-def make_resnet50_gradfn(model: torch.nn.Module, target: int, device: str = "cuda"):
+def make_resnet50_gradfn(model: torch.nn.Module, target: int, device: str = "cuda",
+                         chunk: int = 32):
     """
     target: chi so lop ImageNet (0..999) can giai thich.
+    chunk : so anh moi mini-batch forward/backward (giam de tranh OOM).
     Tra ve grad_fn dung cho path_ensemble_attribution.
     """
     def grad_fn(states: torch.Tensor) -> torch.Tensor:
-        # states: (T, 3, H, W) — la cac trang thai noi suy gamma_r
-        s = states.to(device).clone().requires_grad_(True)
-        logits = model(s)                       # (T, 1000)
-        score = logits[:, target].sum()         # tong theo batch -> grad tach roi theo hang
-        grad, = torch.autograd.grad(score, s)   # (T, 3, H, W)
-        return grad.detach()
+        # states: (T, 3, H, W) — cac trang thai noi suy gamma_r
+        T = states.shape[0]
+        out = torch.empty_like(states)
+        for i in range(0, T, chunk):
+            sb = states[i:i + chunk].to(device).clone().requires_grad_(True)
+            logits = model(sb)                       # (b, 1000)
+            score = logits[:, target].sum()          # grad tach roi theo hang
+            grad, = torch.autograd.grad(score, sb)   # (b, 3, H, W)
+            out[i:i + chunk] = grad.detach()
+            del sb, logits, score, grad
+        return out
     return grad_fn
 
 

@@ -5,14 +5,14 @@ Chay (torch GPU mac dinh, tu chay lay):
     python compare_batch.py benchmark_50 --N 500 --chunk 16
     python compare_batch.py benchmark_50 --N 500 --substrate black --glob '*.JPEG'
 
-Voi moi anh: chay IG(4 baseline)/EG/SBA/SBA-D/BlurLIG/BlurLIG-Full/PEA/Tube-EG duoi
-cung ngan sach N, do insertion/deletion/I-D. Sau MOI anh in bang thong ke TICH LUY
-(running mean±SE + win%) — theo doi truc tiep ai dang dan dau khi so anh tang.
+Voi moi anh: chay IG(4 baseline)/IG-Spectral(FFT,PCA)/EG/SBA/SBA-D/BlurLIG/Diffusion*/
+PEA/Tube-EG duoi cung ngan sach N, do insertion/deletion/I-D. Sau MOI anh in bang
+thong ke TICH LUY (running mean±SE + win%) — theo doi truc tiep ai dang dan dau.
 Cuoi cung in bang tong + paired test (Wilcoxon/paired-t) BlurLIG vs cac method.
 Luu results.csv (tung anh), summary.csv (tong hop), paired_tests.csv.
 
-Luu y: BlurLIG-Full rat dat (O(T*N*N) eval/anh); tat bang --no_lig_full neu chi can
-so cac method re. Khong train, khong smoketest.
+Spectral reference: blur = FFT-mode cua khung thong nhat; IG-Spectral-PCA test
+gia thuyet 'tan so ~ phuong sai'. Khong train, khong smoketest.
 """
 
 import argparse
@@ -29,10 +29,10 @@ from pea.resnet50_gradfn import (
 from pea.insdel import insertion_deletion
 from pea.methods import ig_single, eg, sba, sba_d
 from pea.blur_lig import blur_lig
-from pea.blur_lig_full import blur_lig_full, make_fvals_fn
 from pea.diffusion_path import diffusion_ig, diffusion_pf, diffusion_ig_multiref, diffusion_forward
 from pea.estimator import path_ensemble_attribution
 from pea.schedules import make_patch_groups
+from pea.spectral_reference import spectral_reference_fft, spectral_reference_pca, _pca_basis
 
 
 def parse_args():
@@ -44,16 +44,17 @@ def parse_args():
     ap.add_argument("--sba_sigma", type=float, default=0.3)
     ap.add_argument("--sba_P", type=int, default=4)
     ap.add_argument("--rho", type=float, default=0.2, help="schedule-strength cho PEA")
-    ap.add_argument("--grid", type=int, default=14, help="patch grid cho PEA / group cho LIG-Full")
+    ap.add_argument("--grid", type=int, default=14, help="patch grid cho PEA")
     ap.add_argument("--L", type=int, default=6, help="so mode cosine cho PEA")
     ap.add_argument("--pea_P", type=int, default=25, help="so path cho PEA/Tube-EG")
-    ap.add_argument("--lig_T", type=int, default=10, help="so vong alternating cho BlurLIG-Full")
-    ap.add_argument("--lig_N", type=int, default=50, help="so buoc path cho BlurLIG-Full (nho vi Phase2 dat)")
-    ap.add_argument("--lig_exact_mu", action="store_true", help="Phase1 dung mu∝|d_k| thay vi QP")
-    ap.add_argument("--lig_init", type=str, default="blurlig", choices=["blurlig", "straight"],
-                    help="khoi tao BlurLIG-Full: 'blurlig' / 'straight'")
-    ap.add_argument("--no_lig_full", action="store_true",
-                    help="BO BlurLIG-Full (rat dat: O(T*N*N) eval/anh)")
+    # --- Spectral reference (khung thong nhat: blur = FFT-mode) ---
+    ap.add_argument("--spec_sigma_fft", type=float, default=8.0,
+                    help="sigma (pixel) cho spectral-FFT reference (~ blur)")
+    ap.add_argument("--spec_sigma_pca", type=float, default=1.0,
+                    help="sigma co PC cho spectral-PCA reference (patch-PCA cua chinh anh)")
+    ap.add_argument("--spec_patch", type=int, default=8,
+                    help="canh patch de dung PCA basis tu chinh anh")
+    ap.add_argument("--no_spectral", action="store_true", help="BO ca hai spectral reference")
     # --- Diffusion-path (VP-SDE forward analytic + PF-ODE-style) ---
     ap.add_argument("--diff_beta_min", type=float, default=0.1, help="beta_min lich VP cho Diffusion")
     ap.add_argument("--diff_beta_max", type=float, default=20.0, help="beta_max lich VP cho Diffusion")
@@ -101,6 +102,23 @@ def make_baselines(x, device, seed):
     return ["black", "white", "noise", "blur"], torch.stack([black, white, noise, blur])
 
 
+def make_pca_patch_reference(x, patch=8, sigma=1.0):
+    """Spectral-PCA reference tu chinh anh (patch pxp, PCA, co PC phuong sai thap)."""
+    C, H, W = x.shape
+    p = patch
+    Hc, Wc = (H // p) * p, (W // p) * p
+    xc = x[:, :Hc, :Wc]
+    patches = xc.unfold(1, p, p).unfold(2, p, p)          # (C,nH,nW,p,p)
+    nH, nW = patches.shape[1], patches.shape[2]
+    P = patches.permute(1, 2, 0, 3, 4).reshape(nH * nW, C * p * p)
+    basis = _pca_basis(P)
+    Pref = spectral_reference_pca(P, basis=basis, sigma=sigma, shrink="gauss")
+    Pref = Pref.reshape(nH, nW, C, p, p).permute(2, 0, 3, 1, 4).reshape(C, Hc, Wc)
+    ref = x.clone()
+    ref[:, :Hc, :Wc] = Pref
+    return ref
+
+
 def attributions_for_image(x, grad_fn, args, device, seed, model, target):
     """Tra ve dict {method_name: attr(3,H,W)}. Day du nhu compare.py."""
     gen = torch.Generator(device=device); gen.manual_seed(seed)
@@ -110,6 +128,14 @@ def attributions_for_image(x, grad_fn, args, device, seed, model, target):
     out = {}
     for nm, b in zip(names, baselines):
         out[f"IG-{nm}"] = ig_single(x, b, grad_fn, T=args.N)
+
+    # Spectral reference (khung thong nhat): blur = FFT-mode. Linear ref->x + IG.
+    if not args.no_spectral:
+        spec_fft = spectral_reference_fft(x, sigma=args.spec_sigma_fft)
+        out["IG-Spectral-FFT"] = ig_single(x, spec_fft, grad_fn, T=args.N)
+        spec_pca = make_pca_patch_reference(x, patch=args.spec_patch, sigma=args.spec_sigma_pca)
+        out["IG-Spectral-PCA"] = ig_single(x, spec_pca, grad_fn, T=args.N)
+
     out["EG"] = eg(x, baselines, grad_fn, N=args.N)
     out["SBA"] = sba(x, baselines, grad_fn, N=args.N, sigma=args.sba_sigma, P=args.sba_P, gen=gen)
     out["SBA-D"] = sba_d(x, baselines, grad_fn, N=args.N, gen=gen)
@@ -147,18 +173,6 @@ def attributions_for_image(x, grad_fn, args, device, seed, model, target):
             beta_min=args.diff_beta_min, beta_max=args.diff_beta_max,
             P=args.fwd_P, t_max=args.fwd_tmax, use_lig=args.fwd_lig,
             gen=gen, model=model, target=target, score=args.score,
-        )
-
-    # BlurLIG-Full (Algorithm 1 tren blur reference). Rat dat -> co the tat bang --no_lig_full.
-    if not args.no_lig_full:
-        gidx_lig = make_patch_groups(C, H, W, grid=args.grid).to(device)
-        fvals_fn = make_fvals_fn(model, target, device, chunk=args.chunk, score=args.score)
-        out["BlurLIG-Full"] = blur_lig_full(
-            x, blur_baseline, grad_fn, fvals_fn,
-            group_index=gidx_lig, G=args.grid * args.grid, N=args.lig_N,
-            T=args.lig_T, lam=1.0, tau=0.01,
-            use_exact_measure=args.lig_exact_mu, init=args.lig_init, generator=gen,
-            model=model, target=target, score=args.score,
         )
 
     # PEA + Tube-EG (cung pool baseline blur, cung ngan sach N)

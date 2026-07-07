@@ -154,6 +154,7 @@ def blur_lig_full(
     group_index, G, N,
     T=10, lam=1.0, tau=0.01,
     path_lr=0.5, fd_eps=0.05, use_exact_measure=False,
+    init="blurlig",
     generator=None, model=None, target=None, score="logit",
 ):
     """
@@ -168,6 +169,15 @@ def blur_lig_full(
     path_lr          : buoc cap nhat velocity V (Phase 2).
     fd_eps           : do lon finite-difference probe cho dJ/dV.
     use_exact_measure: True -> Phase 1 dung mu_k ∝ |d_k| (gioi han tau->0) thay vi QP.
+    init             : cach khoi tao measure/path o vong 0:
+                       "blurlig"  (mac dinh) -> seed measure = LIG-measure tren path blur
+                                    (giong het blur_lig o vong 0), roi moi be path. Tuc la
+                                    xuat phat DUNG tu diem blur_lig da thang, alternating chi
+                                    co the cai them (hoac giu nguyen).
+                       "straight" -> measure uniform ban dau, path duong thang blur->x,
+                                    dung nhu Algorithm 1 goc cua LIG.
+                       Ca hai deu co vet ban dau la duong thang blur->x; khac o measure seed
+                       va thu tu Phase 1 chay truoc Phase 2 o vong dau.
 
     Tra ve attribution (3,H,W).
     """
@@ -179,10 +189,19 @@ def blur_lig_full(
         assert model is not None and target is not None, "can fvals_fn hoac (model,target)"
         fvals_fn = make_fvals_fn(model, target, device, score=score)
 
-    # khoi tao velocity: all-ones => path ban dau la DUONG THANG x0->x (uniform delivery)
+    # khoi tao velocity: all-ones => vet ban dau la DUONG THANG x0->x (uniform delivery).
+    # Ca 2 mode deu bat dau tu vet nay; khac o MEASURE seed.
     V = torch.ones(G, N, device=device)
 
-    mu = torch.full((N,), 1.0 / N, device=device)
+    if init == "blurlig":
+        # seed measure = LIG-measure tren path blur (giong het blur_lig o vong 0).
+        # Tinh d_k, df_k tren duong thang blur->x roi lay mu = update_measure.
+        path0 = _path_from_V(x0, dx, V, group_index, shape)
+        dk0, dfk0, _, _ = _eval_path(path0, grad_fn, fvals_fn)
+        mu = _update_measure(dk0, dfk0, lam, tau, use_exact=use_exact_measure)
+    else:
+        # "straight": uniform ban dau, dung Algorithm 1 goc.
+        mu = torch.full((N,), 1.0 / N, device=device)
 
     for s in range(T):
         # ---- xay path tu V hien tai ----
@@ -190,7 +209,11 @@ def blur_lig_full(
         dk, dfk, g, dgamma = _eval_path(path, grad_fn, fvals_fn)
 
         # ---- Phase 1: update measure (fix path) ----
-        mu = _update_measure(dk, dfk, lam, tau, use_exact=use_exact_measure)
+        # "blurlig": update measure MOI vong (ke ca vong 0) => Phase 2 luon dung LIG-measure.
+        # "straight": vong 0 GIU mu uniform (khoi tao), chi update measure tu vong 1 tro di,
+        #             dung nhu Algorithm 1 goc (be path truoc, don measure sau).
+        if not (init == "straight" and s == 0):
+            mu = _update_measure(dk, dfk, lam, tau, use_exact=use_exact_measure)
 
         # ---- Phase 2: update path (fix measure), grouped-velocity heuristic ----
         if s < T - 1:

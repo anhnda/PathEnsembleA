@@ -40,6 +40,8 @@ def parse_args():
     ap.add_argument("--lig_T", type=int, default=10, help="so vong alternating cho BlurLIG-Full")
     ap.add_argument("--lig_N", type=int, default=50, help="so buoc path cho BlurLIG-Full (nho vi Phase2 dat)")
     ap.add_argument("--lig_exact_mu", action="store_true", help="Phase1 dung mu∝|d_k| thay vi QP")
+    ap.add_argument("--lig_init", type=str, default="blurlig", choices=["blurlig", "straight"],
+                    help="khoi tao BlurLIG-Full: 'blurlig' (mac dinh, seed=LIG-measure tren path blur) / 'straight' (uniform, Algorithm 1 goc)")
     ap.add_argument("--chunk", type=int, default=16)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--seed", type=int, default=0)
@@ -125,7 +127,7 @@ def main():
         x, blur_baseline, grad_fn, fvals_fn,
         group_index=gidx_lig, G=G_lig, N=args.lig_N,
         T=args.lig_T, lam=1.0, tau=0.01,
-        use_exact_measure=args.lig_exact_mu, generator=gen,
+        use_exact_measure=args.lig_exact_mu, init=args.lig_init, generator=gen,
         model=model, target=target, score=args.score,
     )
 

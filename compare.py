@@ -21,7 +21,7 @@ from pea.resnet50_gradfn import load_resnet50, make_resnet50_gradfn, preprocess,
 from pea.insdel import insertion_deletion
 from pea.methods import ig_single, eg, sba, sba_d
 from pea.blur_bridge import (
-    blur_bridge, blur_bridge_lig, blur_selfdiff, blur_selfdiff_lig, blur_plain,
+    blur_bridge, blur_bridge_lig, blur_selfdiff, blur_selfdiff_lig, blur_plain, blur_reparam,
 )
 from pea.estimator import path_ensemble_attribution
 from pea.schedules import make_patch_groups
@@ -48,6 +48,8 @@ def parse_args():
                     help="so trajectory cho self-diffusion (B*P*T ~ N)")
     ap.add_argument("--sd_ksize", type=int, default=31,
                     help="kich thuoc heat kernel lam muot noise (scale-space)")
+    ap.add_argument("--rp_probe", type=float, default=0.4,
+                    help="ti le ngan sach cho buoc probe |d_k| cua blur_reparam")
     ap.add_argument("--chunk", type=int, default=16)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--seed", type=int, default=0)
@@ -139,6 +141,11 @@ def main():
         x, blur_baseline, grad_fn, N=N,
         sigma=args.sd_sigma, P=args.sd_P, ksize=args.sd_ksize, gen=gen,
         model=model, target=target, score=args.score,
+    )
+    # BlurReparam: HAP THU measure |d_k| vao PATH (reparam thoi gian) -> uniform tren vet moi.
+    # 1 method path thuan, khong con pha measure rieng. Ky vong ~ BlurBridge+LIG.
+    attrs["BlurReparam"] = blur_reparam(
+        x, blur_baseline, grad_fn, N=N, probe_frac=args.rp_probe,
     )
 
     # PEA + Tube-EG (cung pool baseline, cung ngan sach N)

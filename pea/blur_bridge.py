@@ -71,6 +71,79 @@ def blur_plain(x, blur_baseline, grad_fn, N):
         return (g * dgamma).sum(dim=0)         # uniform Ito (moi buoc trong so 1)
 
 
+# ===========================================================================
+# blur_reparam: HAP THU measure vao PATH bang reparametrize thoi gian.
+#
+# Y: IG bat bien voi reparametrization. mu_k ∝ |d_k| (don trong so vao buoc |d| lon)
+# TUONG DUONG voi di CHAM lai (nhieu node) o vung |d| lon, di NHANH o vung phang,
+# doc CUNG vet de-blur. Sau khi phan bo lai node theo mat do ∝ |d|, quadrature
+# UNIFORM tren vet moi == quadrature |d_k|-weighted tren vet cu. Measure bien mat,
+# nuot vao lich trinh node s(t). => 1 method path thuan, khong con pha measure rieng.
+#
+# Thuat toan (arc-length theo |d|):
+#   1. probe: di de-blur thang T_p buoc, do |d_k| = |g_k . dgamma_k| moi buoc.
+#   2. CDF: C_k = cumsum(|d_k|)/sum(|d_k|)  (tang, 0->1, endpoint-preserving).
+#   3. node moi: chon T_i vi tri s_new sao cho khoi luong |d| giua 2 node bang nhau
+#      = noi suy nghich dao C tai cac muc deu {i/T_i}. Node dammy vao transition.
+#   4. tich phan UNIFORM Ito tren cac node moi (di qua CUNG cac diem anh, chi doi mat do).
+#
+# Khong drift, khong stochastic. Ngan sach: T_probe + T_integ = N.
+# Neu smooth_frac>0, lam muot |d| truoc khi lay CDF de node khong giat.
+# ===========================================================================
+def blur_reparam(x, blur_baseline, grad_fn, N, probe_frac=0.4, smooth_k=5, eps=1e-9):
+    """
+    Hap thu mu_k ∝ |d_k| vao path bang reparam thoi gian tren vet de-blur.
+    N: ngan sach grad. probe_frac: ti le N danh cho buoc probe do |d_k|.
+    smooth_k: cua so lam muot |d| (0 = khong). Tra ve attribution (3,H,W).
+    """
+    device = x.device
+    x0 = blur_baseline
+    dx = (x - x0)
+
+    T_probe = max(2, int(N * probe_frac))
+    T_integ = max(2, N - T_probe)
+
+    # --- 1. probe de-blur thang, do |d_k| ---
+    with torch.no_grad():
+        s_probe = torch.linspace(0.0, 1.0, T_probe + 1, device=device).view(-1, 1, 1, 1)
+        probe_path = x0[None] + s_probe * dx[None]          # (T_probe+1,3,H,W)
+    g_probe = grad_fn(probe_path[:-1])                       # (T_probe,3,H,W)
+    with torch.no_grad():
+        dgamma_p = probe_path[1:] - probe_path[:-1]
+        dk = (g_probe * dgamma_p).flatten(1).sum(dim=1).abs()   # (T_probe,) |d_k|
+
+        # lam muot |d| de node khong giat (moving average)
+        if smooth_k and smooth_k > 1:
+            ker = torch.ones(1, 1, smooth_k, device=device) / smooth_k
+            dk = F.conv1d(dk.view(1, 1, -1), ker, padding=smooth_k // 2).view(-1)[:dk.numel()]
+        dk = dk + eps                                        # tranh 0
+
+        # --- 2. CDF theo |d| tren luoi probe (mid-point cua moi buoc) ---
+        # gan |d_k| cho khoang [s_k, s_{k+1}]; CDF tai node = cumsum khoi luong
+        w = dk / dk.sum()                                    # (T_probe,)
+        C = torch.cat([torch.zeros(1, device=device), w.cumsum(0)])   # (T_probe+1,), 0..1
+        s_nodes_probe = torch.linspace(0.0, 1.0, T_probe + 1, device=device)  # s tuong ung C
+
+        # --- 3. nghich dao C tai cac muc deu -> node moi dammy vao transition ---
+        levels = torch.linspace(0.0, 1.0, T_integ + 1, device=device)        # {i/T_integ}
+        # tim s_new sao cho C(s_new) = levels  (noi suy tuyen tinh nghich dao)
+        idx = torch.searchsorted(C, levels.clamp(0, 1), right=False).clamp(1, T_probe)
+        C_lo, C_hi = C[idx - 1], C[idx]
+        s_lo, s_hi = s_nodes_probe[idx - 1], s_nodes_probe[idx]
+        frac = ((levels - C_lo) / (C_hi - C_lo + eps)).clamp(0, 1)
+        s_new = (s_lo + frac * (s_hi - s_lo)).clamp(0, 1)     # (T_integ+1,) tang, 0->1
+        s_new[0] = 0.0; s_new[-1] = 1.0                       # neo endpoint
+
+        # --- 4. path moi: cung vet de-blur, mat do node ∝ |d| ---
+        path = x0[None] + s_new.view(-1, 1, 1, 1) * dx[None]  # (T_integ+1,3,H,W)
+
+    g = grad_fn(path[:-1])                                    # left-point Ito (T_integ,3,H,W)
+    with torch.no_grad():
+        dgamma = path[1:] - path[:-1]
+        return (g * dgamma).sum(dim=0)                        # UNIFORM Ito == |d|-weighted tren vet goc
+
+
+
 # ---------------------------------------------------------------------------
 # blur_bridge: heat reference + Follmer-lite drift huong tang f.
 #   Vong lap: tren reference de-blur path, moi buoc uoc luong grad g_k, roi day

@@ -20,9 +20,7 @@ import torch
 from pea.resnet50_gradfn import load_resnet50, make_resnet50_gradfn, preprocess, IMAGENET_MEAN, IMAGENET_STD
 from pea.insdel import insertion_deletion
 from pea.methods import ig_single, eg, sba, sba_d
-from pea.blur_bridge import (
-    blur_bridge, blur_bridge_lig, blur_selfdiff, blur_selfdiff_lig, blur_plain, blur_reparam,
-)
+from pea.blur_lig import blur_lig
 from pea.estimator import path_ensemble_attribution
 from pea.schedules import make_patch_groups
 
@@ -38,18 +36,6 @@ def parse_args():
     ap.add_argument("--grid", type=int, default=14, help="patch grid cho PEA")
     ap.add_argument("--L", type=int, default=6, help="so mode cosine cho PEA")
     ap.add_argument("--pea_P", type=int, default=25, help="so path cho PEA/Tube-EG")
-    ap.add_argument("--bb_drift", type=float, default=0.15,
-                    help="cuong do drift cho blur-bridge (0 => thu ve BlurIG)")
-    ap.add_argument("--bb_iters", type=int, default=1,
-                    help="so vong tinh-chinh path bang grad-probe cho blur-bridge")
-    ap.add_argument("--sd_sigma", type=float, default=0.3,
-                    help="bien do heat-correlated noise cho self-diffusion (0 => BlurIG)")
-    ap.add_argument("--sd_P", type=int, default=4,
-                    help="so trajectory cho self-diffusion (B*P*T ~ N)")
-    ap.add_argument("--sd_ksize", type=int, default=31,
-                    help="kich thuoc heat kernel lam muot noise (scale-space)")
-    ap.add_argument("--rp_probe", type=float, default=0.4,
-                    help="ti le ngan sach cho buoc probe |d_k| cua blur_reparam")
     ap.add_argument("--chunk", type=int, default=16)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--seed", type=int, default=0)
@@ -118,34 +104,10 @@ def main():
     # SBA-D barycentric + Ito
     attrs["SBA-D"] = sba_d(x, blur_baseline, grad_fn, N=N, gen=gen)
 
-    # BlurBridge: heat-reference path + Follmer-lite drift huong tang f (bb_drift=0 => BlurIG)
-    attrs["BlurBridge"] = blur_bridge(
-        x, blur_baseline, grad_fn, N=N,
-        drift_scale=args.bb_drift, drift_iters=args.bb_iters,
-    )
-    # ---- Bang 2x2 tach truc PATH (de-blur thang / self-diffusion) x MEASURE (uniform / LIG) ----
-    # o (de-blur thang x uniform) = BlurIG goc, viet trong dung khung nay:
-    attrs["BlurPlain"] = blur_plain(x, blur_baseline, grad_fn, N=N)
-    # o (de-blur thang x LIG) = LIG-measure tren path de-blur, drift=0 mac dinh (measure-only):
-    attrs["BlurBridge+LIG"] = blur_bridge_lig(
+    # BlurLIG: de-blur path + LIG-measure mu_k ∝ |d_k| (method thang, khong drift/selfdiff/reparam)
+    attrs["BlurLIG"] = blur_lig(
         x, blur_baseline, grad_fn, N=N,
         model=model, target=target, score=args.score,
-    )
-    # o (self-diffusion x uniform):
-    attrs["SelfDiff"] = blur_selfdiff(
-        x, blur_baseline, grad_fn, N=N,
-        sigma=args.sd_sigma, P=args.sd_P, ksize=args.sd_ksize, gen=gen,
-    )
-    # o (self-diffusion x LIG):
-    attrs["SelfDiff+LIG"] = blur_selfdiff_lig(
-        x, blur_baseline, grad_fn, N=N,
-        sigma=args.sd_sigma, P=args.sd_P, ksize=args.sd_ksize, gen=gen,
-        model=model, target=target, score=args.score,
-    )
-    # BlurReparam: HAP THU measure |d_k| vao PATH (reparam thoi gian) -> uniform tren vet moi.
-    # 1 method path thuan, khong con pha measure rieng. Ky vong ~ BlurBridge+LIG.
-    attrs["BlurReparam"] = blur_reparam(
-        x, blur_baseline, grad_fn, N=N, probe_frac=args.rp_probe,
     )
 
     # PEA + Tube-EG (cung pool baseline, cung ngan sach N)

@@ -30,7 +30,7 @@ from pea.insdel import insertion_deletion
 from pea.methods import ig_single, eg, sba, sba_d
 from pea.blur_lig import blur_lig
 from pea.blur_lig_full import blur_lig_full, make_fvals_fn
-from pea.diffusion_path import diffusion_ig, diffusion_pf
+from pea.diffusion_path import diffusion_ig, diffusion_pf, diffusion_ig_multiref
 from pea.estimator import path_ensemble_attribution
 from pea.schedules import make_patch_groups
 
@@ -62,6 +62,10 @@ def parse_args():
     ap.add_argument("--diff_score_scale", type=float, default=0.15, help="cuong do score-proxy de-blur cho Diffusion-PF (0 => VP thuan)")
     ap.add_argument("--diff_no_lig", action="store_true", help="Diffusion-PF dung uniform Ito thay vi LIG-measure")
     ap.add_argument("--no_diffusion", action="store_true", help="BO ca hai method Diffusion")
+    ap.add_argument("--diff_R", type=int, default=4, help="so blur reference (nhiet do) cho Diffusion-MultiRef")
+    ap.add_argument("--diff_sigma_min", type=float, default=1.0, help="blur nhe nhat (pixel) cho Diffusion-MultiRef")
+    ap.add_argument("--diff_sigma_max", type=float, default=25.0, help="blur nang nhat (pixel) cho Diffusion-MultiRef")
+    ap.add_argument("--no_multiref", action="store_true", help="BO Diffusion-MultiRef")
     ap.add_argument("--chunk", type=int, default=16)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--seed", type=int, default=0)
@@ -120,6 +124,15 @@ def attributions_for_image(x, grad_fn, args, device, seed, model, target):
             x, blur_baseline, grad_fn, N=args.N,
             beta_min=args.diff_beta_min, beta_max=args.diff_beta_max,
             score_scale=args.diff_score_scale, use_lig=not args.diff_no_lig,
+            model=model, target=target, score=args.score,
+        )
+
+    # Diffusion-MultiRef: HO blur reference theo nhiet do (tan cong truc BASELINE).
+    if not args.no_diffusion and not args.no_multiref:
+        out["Diffusion-MultiRef"] = diffusion_ig_multiref(
+            x, grad_fn, N=args.N,
+            R=args.diff_R, sigma_min=args.diff_sigma_min, sigma_max=args.diff_sigma_max,
+            beta_min=args.diff_beta_min, beta_max=args.diff_beta_max,
             model=model, target=target, score=args.score,
         )
 

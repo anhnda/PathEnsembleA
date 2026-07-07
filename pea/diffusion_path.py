@@ -211,3 +211,104 @@ def diffusion_pf(x, blur_baseline, grad_fn, N,
             total = (fvals_fn(x[None]).reshape(()) - fvals_fn(x0[None]).reshape(()))
             attr = attr * (total / (attr.sum() + 1e-12))
     return attr
+
+# ===========================================================================
+# (3) diffusion_ig_multiref : VP-SDE path tu MOT HO blur reference theo NHIET DO.
+#
+# Dong co: forward heat diffusion khong cho 1 baseline, no cho CA QUY DAO trang thai
+# mat-thong-tin, tham so hoa boi nhiet do t (blur=heat, ∂I/∂t=∇²I). Single-blur =
+# chon 1 lat cat t* co dinh roi vut phan con lai. O day ta lay KY VONG tren chinh
+# quy dao heat: sinh R blur reference o R muc sigma khac nhau, moi cai = 1 nhiet do
+# tren quy dao, chay 1 VP de-noising path rieng, roi trung binh attribution.
+#
+# Day la o TAN CONG DUNG TRUC BASELINE (khac diffusion_ig / diffusion_pf, von fix 1
+# blur reference). Endpoint gio la 1 HO {x0_i}, khong con 1 diem => bo duoc "phai-chon-
+# 1-baseline" theo nghia manh, dung tinh than "forward diffusion cho ho baseline theo
+# nhiet do".
+#
+# Sigma schedule bam quy dao VP: map muc nhieu abar_i (deu tren [t_lo,t_hi]) sang
+# sigma_pix_i. abar cao (nhieu it) -> sigma nho (blur nhe); abar thap -> sigma lon
+# (blur nang, gan anh hang so). Moi reference x0_i = Gaussian_blur(x, sigma_i), tuc
+# nam DUNG tren manifold scale-space cua x (khong phai diem ngoai phan bo).
+#
+# Ngan sach: R reference * T buoc = N grad eval. (sinh blur = conv, KHONG ton grad.)
+# Completeness rescale ve TRUNG BINH f(x)-f(x0_i) neu co (model,target).
+#
+# API giong cac method khac. Khong train, khong stochastic (deterministic theo lich).
+# ===========================================================================
+@torch.no_grad()
+def _blur_at_sigma(x, sigma_pix, ksize=None):
+    """Gaussian blur cua x o mot muc sigma (pixel). Tra ve (3,H,W). = 1 nhiet do heat."""
+    device, dtype = x.device, x.dtype
+    if ksize is None:
+        # kernel du rong cho sigma: ~6 sigma, le hoa
+        ksize = int(2 * round(3 * float(sigma_pix)) + 1)
+        ksize = max(3, ksize)
+    k1d = _heat_kernel1d(ksize, float(sigma_pix), device, dtype)
+    return _heat_smooth(x[None], k1d)[0]
+
+
+@torch.no_grad()
+def _sigma_schedule(R, sigma_min=1.0, sigma_max=25.0, beta_min=0.1, beta_max=20.0,
+                    t_lo=0.15, t_hi=0.95, device="cpu"):
+    """
+    R muc sigma bam quy dao VP: lay abar deu tren [t_lo,t_hi] roi map sang sigma.
+    abar cao (t nho) -> blur nhe (sigma nho); abar thap (t lon) -> blur nang.
+    Dung map log-tuyen-tinh sigma theo (1 - sqrt(abar)) de sigma tang don dieu cung t.
+    Tra ve (R,) sigma_pix tang dan.
+    """
+    t = torch.linspace(t_lo, t_hi, R, device=device)
+    abar = _vp_abar(t, beta_min, beta_max)          # (R,), giam dan theo t
+    frac = (1.0 - abar.sqrt()).clamp(0, 1)          # 0..1 tang dan theo t
+    # log-interp sigma de trai deu ve mat thi giac
+    log_lo, log_hi = torch.log(torch.tensor(sigma_min)), torch.log(torch.tensor(sigma_max))
+    sigma = torch.exp(log_lo + frac * (log_hi - log_lo))
+    return sigma                                    # (R,) tang dan
+
+
+def diffusion_ig_multiref(x, grad_fn, N,
+                          R=4, sigma_min=1.0, sigma_max=25.0,
+                          beta_min=0.1, beta_max=20.0,
+                          t_lo=0.15, t_hi=0.95, ksize=None,
+                          model=None, target=None, score="logit"):
+    """
+    VP-SDE de-noising path tu MOT HO blur reference theo nhiet do, ky vong tren R ref.
+
+    x         : (3,H,W) da chuan hoa.
+    grad_fn   : (M,3,H,W)->(M,3,H,W).
+    N         : ngan sach grad; R*T = N.
+    R         : so blur reference (= so nhiet do lay tren quy dao heat).
+    sigma_min/max : dai blur (pixel) — nhe nhat -> nang nhat.
+    beta_min/max, t_lo/t_hi : lich VP dinh cach trai sigma theo nhiet do.
+    ksize     : kernel size Gaussian (None => tu chon ~6*sigma).
+    model,target,score : de completeness rescale ve trung binh f(x)-f(x0_i).
+
+    Tra ve attribution (3,H,W) = trung binh attribution tren ca ho reference.
+    """
+    device = x.device
+    T = max(2, N // max(1, R))
+    sigmas = _sigma_schedule(R, sigma_min, sigma_max, beta_min, beta_max,
+                             t_lo, t_hi, device=device)     # (R,)
+
+    # luoi VP dung chung cho moi reference (deterministic)
+    base = torch.linspace(1.0, 0.0, T + 1, device=device)   # 1~x0 .. 0~x
+    coef = _vp_abar(base, beta_min, beta_max).sqrt().view(-1, 1, 1, 1)  # (T+1,1,1,1)
+
+    acc = torch.zeros_like(x)
+    fvals_fn = _resolve_fvals(None, model, target, score, device)
+
+    for i in range(R):
+        with torch.no_grad():
+            x0 = _blur_at_sigma(x, sigmas[i], ksize=ksize)  # reference o nhiet do i
+            dx = (x - x0)
+            path = x0[None] + coef * dx[None]               # (T+1,3,H,W)
+            path[0] = x0; path[-1] = x
+        g = grad_fn(path[:-1])                              # left-point Ito
+        with torch.no_grad():
+            attr_i = (g * (path[1:] - path[:-1])).sum(dim=0)
+            # completeness per-reference: rescale attr_i -> f(x)-f(x0_i)
+            if fvals_fn is not None:
+                total_i = (fvals_fn(x[None]).reshape(()) - fvals_fn(x0[None]).reshape(()))
+                attr_i = attr_i * (total_i / (attr_i.sum() + 1e-12))
+            acc += attr_i
+    return acc / max(1, R)

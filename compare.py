@@ -25,6 +25,7 @@ from pea.blur_lig_full import blur_lig_full, make_fvals_fn
 from pea.diffusion_path import diffusion_ig, diffusion_pf, diffusion_ig_multiref, diffusion_forward
 from pea.estimator import path_ensemble_attribution
 from pea.schedules import make_patch_groups
+from pea.spectral_reference import spectral_reference_fft, spectral_reference_pca, _pca_basis
 
 
 def parse_args():
@@ -58,6 +59,14 @@ def parse_args():
     ap.add_argument("--fwd_tmax", type=float, default=0.9, help="muc nhieu cuc dai cho Diffusion-Forward (0..1)")
     ap.add_argument("--fwd_lig", action="store_true", help="Diffusion-Forward dung LIG-measure thay vi uniform")
     ap.add_argument("--no_forward", action="store_true", help="BO Diffusion-Forward")
+    # --- Spectral reference (khung thong nhat: blur = FFT-mode) ---
+    ap.add_argument("--spec_sigma_fft", type=float, default=8.0,
+                    help="sigma (pixel) cho spectral-FFT reference (~ blur; k/3~10 la blur cu)")
+    ap.add_argument("--spec_sigma_pca", type=float, default=1.0,
+                    help="sigma co PC cho spectral-PCA reference (patch-PCA cua chinh anh)")
+    ap.add_argument("--spec_patch", type=int, default=8,
+                    help="canh patch de dung PCA basis tu chinh anh (test tan-so=phuong-sai)")
+    ap.add_argument("--no_spectral", action="store_true", help="BO ca hai spectral reference")
     ap.add_argument("--chunk", type=int, default=16)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--seed", type=int, default=0)
@@ -87,6 +96,30 @@ def make_baselines(x, device, seed):
     blur = xb[0]
     names = ["black", "white", "noise", "blur"]
     return names, torch.stack([black, white, noise, blur])
+
+
+def make_pca_patch_reference(x, patch=8, sigma=1.0):
+    """
+    Spectral-PCA reference tu chinh anh: cat thanh patch pxp, PCA tap patch,
+    co PC phuong sai thap (=chi tiet rieng), giu PC dau (=cau truc chung), ghep lai.
+    Test gia thuyet 'tan so ~ phuong sai': neu ref nay ~ blur => Fourier & PCA dong truc.
+    x: (3,H,W). Tra ve (3,H,W).
+    """
+    C, H, W = x.shape
+    p = patch
+    Hc, Wc = (H // p) * p, (W // p) * p                 # cat cho chia het
+    xc = x[:, :Hc, :Wc]
+    # (C, Hc/p, p, Wc/p, p) -> (num_patch, C*p*p)
+    patches = xc.unfold(1, p, p).unfold(2, p, p)        # (C, nH, nW, p, p)
+    nH, nW = patches.shape[1], patches.shape[2]
+    P = patches.permute(1, 2, 0, 3, 4).reshape(nH * nW, C * p * p)   # (Np, D)
+    basis = _pca_basis(P)
+    Pref = spectral_reference_pca(P, basis=basis, sigma=sigma, shrink="gauss")  # (Np, D)
+    # ghep lai ve anh
+    Pref = Pref.reshape(nH, nW, C, p, p).permute(2, 0, 3, 1, 4).reshape(C, Hc, Wc)
+    ref = x.clone()
+    ref[:, :Hc, :Wc] = Pref
+    return ref
 
 
 def main():
@@ -119,6 +152,15 @@ def main():
     # IG cho tung baseline (moi cai N buoc)
     for nm, b in zip(names, baselines):
         attrs[f"IG-{nm}"] = ig_single(x, b, grad_fn, T=N)
+    # Spectral reference (khung thong nhat): blur = FFT-mode. Linear ref->x + IG.
+    #   Spectral-FFT: bang blur nhung qua Fourier (kiem chung blur la truong hop dac biet).
+    #   Spectral-PCA: reference tu patch-PCA cua chinh anh (test 'tan so ~ phuong sai').
+    if not args.no_spectral:
+        spec_fft = spectral_reference_fft(x, sigma=args.spec_sigma_fft)
+        attrs["IG-Spectral-FFT"] = ig_single(x, spec_fft, grad_fn, T=N)
+        spec_pca = make_pca_patch_reference(x, patch=args.spec_patch, sigma=args.spec_sigma_pca)
+        attrs["IG-Spectral-PCA"] = ig_single(x, spec_pca, grad_fn, T=N)
+
     # EG pool 4 baseline
     attrs["EG"] = eg(x, baselines, grad_fn, N=N)
     # SBA Brownian bridge + Ito

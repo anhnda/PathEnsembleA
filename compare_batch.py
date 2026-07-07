@@ -5,7 +5,7 @@ Chay (torch GPU mac dinh, tu chay lay):
     python compare_batch.py benchmark_50 --N 500 --chunk 16
     python compare_batch.py benchmark_50 --N 500 --substrate black --glob '*.JPEG'
 
-Voi moi anh: chay IG(4 baseline)/EG/SBA/SBA-D duoi cung ngan sach N, do insertion/deletion/I-D.
+Voi moi anh: chay IG(4 baseline)/EG/SBA/SBA-D/BlurLIG duoi cung ngan sach N, do insertion/deletion/I-D.
 Sau do in mean +- SE tren toan bo anh + win-rate (ty le anh method thang I-D cao nhat).
 Luu chi tiet tung anh -> results.csv va tong hop -> summary.csv.
 """
@@ -23,6 +23,7 @@ from pea.resnet50_gradfn import (
 )
 from pea.insdel import insertion_deletion
 from pea.methods import ig_single, eg, sba, sba_d
+from pea.blur_lig import blur_lig
 
 
 def parse_args():
@@ -62,16 +63,19 @@ def make_baselines(x, device, seed):
     return ["black", "white", "noise", "blur"], torch.stack([black, white, noise, blur])
 
 
-def attributions_for_image(x, grad_fn, args, device, seed):
+def attributions_for_image(x, grad_fn, args, device, seed, model, target):
     """Tra ve dict {method_name: attr(3,H,W)}."""
     gen = torch.Generator(device=device); gen.manual_seed(seed)
     names, baselines = make_baselines(x, device, seed)
+    blur_baseline = baselines[-1]
     out = {}
     for nm, b in zip(names, baselines):
         out[f"IG-{nm}"] = ig_single(x, b, grad_fn, T=args.N)
     out["EG"] = eg(x, baselines, grad_fn, N=args.N)
     out["SBA"] = sba(x, baselines, grad_fn, N=args.N, sigma=args.sba_sigma, P=args.sba_P, gen=gen)
     out["SBA-D"] = sba_d(x, baselines, grad_fn, N=args.N, gen=gen)
+    out["BlurLIG"] = blur_lig(x, blur_baseline, grad_fn, N=args.N,
+                              model=model, target=target, score=args.score)
     return out
 
 
@@ -118,7 +122,7 @@ def main():
             target = args.target
         grad_fn = make_resnet50_gradfn(model, target, device, chunk=args.chunk, score=args.score)
 
-        attrs = attributions_for_image(x, grad_fn, args, device, args.seed)
+        attrs = attributions_for_image(x, grad_fn, args, device, args.seed, model, target)
         if metric_names is None:
             metric_names = list(attrs.keys())
             for m in metric_names:

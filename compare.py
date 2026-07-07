@@ -20,6 +20,7 @@ import torch
 from pea.resnet50_gradfn import load_resnet50, make_resnet50_gradfn, preprocess, IMAGENET_MEAN, IMAGENET_STD
 from pea.insdel import insertion_deletion
 from pea.methods import ig_single, eg, sba, sba_d
+from pea.blur_bridge import blur_bridge, blur_bridge_lig
 from pea.estimator import path_ensemble_attribution
 from pea.schedules import make_patch_groups
 
@@ -35,6 +36,10 @@ def parse_args():
     ap.add_argument("--grid", type=int, default=14, help="patch grid cho PEA")
     ap.add_argument("--L", type=int, default=6, help="so mode cosine cho PEA")
     ap.add_argument("--pea_P", type=int, default=25, help="so path cho PEA/Tube-EG")
+    ap.add_argument("--bb_drift", type=float, default=0.15,
+                    help="cuong do drift cho blur-bridge (0 => thu ve BlurIG)")
+    ap.add_argument("--bb_iters", type=int, default=1,
+                    help="so vong tinh-chinh path bang grad-probe cho blur-bridge")
     ap.add_argument("--chunk", type=int, default=16)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--seed", type=int, default=0)
@@ -102,6 +107,18 @@ def main():
     attrs["SBA"] = sba(x, blur_baseline, grad_fn, N=N, sigma=args.sba_sigma, P=args.sba_P, gen=gen)
     # SBA-D barycentric + Ito
     attrs["SBA-D"] = sba_d(x, blur_baseline, grad_fn, N=N, gen=gen)
+
+    # BlurBridge: heat-reference path + Follmer-lite drift huong tang f (bb_drift=0 => BlurIG)
+    attrs["BlurBridge"] = blur_bridge(
+        x, blur_baseline, grad_fn, N=N,
+        drift_scale=args.bb_drift, drift_iters=args.bb_iters,
+    )
+    # BlurBridge + LIG-measure: cung path, do bang mu_k ∝ |d_k| (don ngan sach vao buoc transition)
+    attrs["BlurBridge+LIG"] = blur_bridge_lig(
+        x, blur_baseline, grad_fn, N=N,
+        drift_scale=args.bb_drift, drift_iters=args.bb_iters,
+        model=model, target=target, score=args.score,
+    )
 
     # PEA + Tube-EG (cung pool baseline, cung ngan sach N)
     # P path = pea_P; lap pool baseline cho du P; T = N // P de tong grad ~ N

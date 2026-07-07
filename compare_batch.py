@@ -5,9 +5,14 @@ Chay (torch GPU mac dinh, tu chay lay):
     python compare_batch.py benchmark_50 --N 500 --chunk 16
     python compare_batch.py benchmark_50 --N 500 --substrate black --glob '*.JPEG'
 
-Voi moi anh: chay IG(4 baseline)/EG/SBA/SBA-D/BlurLIG duoi cung ngan sach N, do insertion/deletion/I-D.
-Sau do in mean +- SE tren toan bo anh + win-rate (ty le anh method thang I-D cao nhat).
-Luu chi tiet tung anh -> results.csv va tong hop -> summary.csv.
+Voi moi anh: chay IG(4 baseline)/EG/SBA/SBA-D/BlurLIG/BlurLIG-Full/PEA/Tube-EG duoi
+cung ngan sach N, do insertion/deletion/I-D. Sau MOI anh in bang thong ke TICH LUY
+(running mean±SE + win%) — theo doi truc tiep ai dang dan dau khi so anh tang.
+Cuoi cung in bang tong + paired test (Wilcoxon/paired-t) BlurLIG vs cac method.
+Luu results.csv (tung anh), summary.csv (tong hop), paired_tests.csv.
+
+Luu y: BlurLIG-Full rat dat (O(T*N*N) eval/anh); tat bang --no_lig_full neu chi can
+so cac method re. Khong train, khong smoketest.
 """
 
 import argparse
@@ -24,6 +29,9 @@ from pea.resnet50_gradfn import (
 from pea.insdel import insertion_deletion
 from pea.methods import ig_single, eg, sba, sba_d
 from pea.blur_lig import blur_lig
+from pea.blur_lig_full import blur_lig_full, make_fvals_fn
+from pea.estimator import path_ensemble_attribution
+from pea.schedules import make_patch_groups
 
 
 def parse_args():
@@ -34,6 +42,17 @@ def parse_args():
     ap.add_argument("--N", type=int, default=500)
     ap.add_argument("--sba_sigma", type=float, default=0.3)
     ap.add_argument("--sba_P", type=int, default=4)
+    ap.add_argument("--rho", type=float, default=0.2, help="schedule-strength cho PEA")
+    ap.add_argument("--grid", type=int, default=14, help="patch grid cho PEA / group cho LIG-Full")
+    ap.add_argument("--L", type=int, default=6, help="so mode cosine cho PEA")
+    ap.add_argument("--pea_P", type=int, default=25, help="so path cho PEA/Tube-EG")
+    ap.add_argument("--lig_T", type=int, default=10, help="so vong alternating cho BlurLIG-Full")
+    ap.add_argument("--lig_N", type=int, default=50, help="so buoc path cho BlurLIG-Full (nho vi Phase2 dat)")
+    ap.add_argument("--lig_exact_mu", action="store_true", help="Phase1 dung mu∝|d_k| thay vi QP")
+    ap.add_argument("--lig_init", type=str, default="blurlig", choices=["blurlig", "straight"],
+                    help="khoi tao BlurLIG-Full: 'blurlig' / 'straight'")
+    ap.add_argument("--no_lig_full", action="store_true",
+                    help="BO BlurLIG-Full (rat dat: O(T*N*N) eval/anh)")
     ap.add_argument("--chunk", type=int, default=16)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--seed", type=int, default=0)
@@ -42,6 +61,8 @@ def parse_args():
     ap.add_argument("--score", type=str, default="logit", choices=["logit", "softmax"],
                     help="dung CHUNG cho attribution backward va metric")
     ap.add_argument("--limit", type=int, default=None, help="chi chay N anh dau (debug)")
+    ap.add_argument("--report_every", type=int, default=1,
+                    help="in bang thong ke tich luy moi bao nhieu anh (0 = tat, chi in cuoi)")
     return ap.parse_args()
 
 
@@ -64,10 +85,11 @@ def make_baselines(x, device, seed):
 
 
 def attributions_for_image(x, grad_fn, args, device, seed, model, target):
-    """Tra ve dict {method_name: attr(3,H,W)}."""
+    """Tra ve dict {method_name: attr(3,H,W)}. Day du nhu compare.py."""
     gen = torch.Generator(device=device); gen.manual_seed(seed)
     names, baselines = make_baselines(x, device, seed)
     blur_baseline = baselines[-1]
+    C, H, W = x.shape
     out = {}
     for nm, b in zip(names, baselines):
         out[f"IG-{nm}"] = ig_single(x, b, grad_fn, T=args.N)
@@ -76,6 +98,31 @@ def attributions_for_image(x, grad_fn, args, device, seed, model, target):
     out["SBA-D"] = sba_d(x, baselines, grad_fn, N=args.N, gen=gen)
     out["BlurLIG"] = blur_lig(x, blur_baseline, grad_fn, N=args.N,
                               model=model, target=target, score=args.score)
+
+    # BlurLIG-Full (Algorithm 1 tren blur reference). Rat dat -> co the tat bang --no_lig_full.
+    if not args.no_lig_full:
+        gidx_lig = make_patch_groups(C, H, W, grid=args.grid).to(device)
+        fvals_fn = make_fvals_fn(model, target, device, chunk=args.chunk, score=args.score)
+        out["BlurLIG-Full"] = blur_lig_full(
+            x, blur_baseline, grad_fn, fvals_fn,
+            group_index=gidx_lig, G=args.grid * args.grid, N=args.lig_N,
+            T=args.lig_T, lam=1.0, tau=0.01,
+            use_exact_measure=args.lig_exact_mu, init=args.lig_init, generator=gen,
+            model=model, target=target, score=args.score,
+        )
+
+    # PEA + Tube-EG (cung pool baseline blur, cung ngan sach N)
+    P = args.pea_P
+    reps = (P + baselines.shape[0] - 1) // baselines.shape[0]
+    pea_baselines = blur_baseline.repeat(reps, 1, 1, 1)[:P]
+    gidx = make_patch_groups(C, H, W, grid=args.grid).to(device)
+    T_pea = max(2, args.N // P)
+    phi_pea, phi_tube, _ = path_ensemble_attribution(
+        x, pea_baselines, gidx, grad_fn, n_groups=args.grid * args.grid,
+        L=args.L, rho=args.rho, T=T_pea, generator=gen, log_geometry=False,
+    )
+    out["PEA"] = phi_pea
+    out["Tube-EG"] = phi_tube
     return out
 
 
@@ -195,6 +242,28 @@ def wilcoxon(a, b):
     return (W, z, p)
 
 
+def _print_summary_table(metric_names, acc, id_per_image, n_img, title):
+    """In bang mean±SE (ins/del/id) + win% tren n_img anh da chay. Dung cho ca running lan final."""
+    win_count = {m: 0 for m in metric_names}
+    for d in id_per_image:
+        win_count[max(d, key=d.get)] += 1
+    print(f"\n--- {title} (mean±SE tren {n_img} anh) ---")
+    print(f"{'method':<14}{'insertion↑':>16}{'deletion↓':>16}{'I-D↑':>16}{'win%':>8}")
+    print("-" * 70)
+    best_m, best_id = None, -float("inf")
+    for m in metric_names:
+        im, ise = mean_se(acc[m]["ins"])
+        dm, dse = mean_se(acc[m]["del"])
+        idm, idse = mean_se(acc[m]["id"])
+        winp = 100.0 * win_count[m] / n_img if n_img else 0.0
+        star = ""
+        if idm > best_id:
+            best_id, best_m = idm, m
+        print(f"{m:<14}{im:>8.4f}±{ise:<6.4f}{dm:>8.4f}±{dse:<6.4f}{idm:>8.4f}±{idse:<6.4f}{winp:>7.1f}%")
+    print("-" * 70)
+    print(f"[i] dan dau I-D: {best_m} = {best_id:.4f}")
+
+
 def main():
     args = parse_args()
     device = args.device
@@ -250,26 +319,28 @@ def main():
         id_per_image.append(img_ids)
         best_m = max(img_ids, key=img_ids.get)
         print(f"[{ip+1}/{len(paths)}] {os.path.basename(path):<24} best={best_m} ({img_ids[best_m]:.3f})")
+        # ---- thong ke TICH LUY sau moi anh (running mean±SE + win%) ----
+        if args.report_every > 0 and ((ip + 1) % args.report_every == 0 or ip + 1 == len(paths)):
+            _print_summary_table(metric_names, acc, id_per_image, ip + 1,
+                                 title=f"TICH LUY sau {ip+1} anh")
 
-    # ---- tong hop ----
-    print("\n=== TRUNG BINH TREN {} ANH (mean +- SE) ===".format(len(paths)))
-    print(f"{'method':<12}{'insertion↑':>18}{'deletion↓':>18}{'I-D↑':>18}{'win%':>8}")
-    print("-" * 74)
-
-    # win-rate
+    # ---- tong hop CUOI CUNG ----
+    n_img = len(id_per_image)
     win_count = {m: 0 for m in metric_names}
     for d in id_per_image:
         win_count[max(d, key=d.get)] += 1
-    n_img = len(id_per_image)
 
+    print("\n" + "=" * 74)
+    _print_summary_table(metric_names, acc, id_per_image, n_img,
+                         title=f"KET QUA CUOI CUNG tren {n_img} anh")
+
+    # build summary_rows cho CSV (khong in lai, da in o bang tren)
     summary_rows = []
     for m in metric_names:
         im, ise = mean_se(acc[m]["ins"])
         dm, dse = mean_se(acc[m]["del"])
         idm, idse = mean_se(acc[m]["id"])
         winp = 100.0 * win_count[m] / n_img
-        print(f"{m:<12}{im:>10.4f}±{ise:<6.4f}{dm:>10.4f}±{dse:<6.4f}"
-              f"{idm:>10.4f}±{idse:<6.4f}{winp:>7.1f}%")
         summary_rows.append({
             "method": m, "n": n_img,
             "insertion_mean": im, "insertion_se": ise,
@@ -278,8 +349,6 @@ def main():
         })
 
     best = max(summary_rows, key=lambda r: r["id_mean"])
-    print("-" * 74)
-    print(f"[i] best I-D trung binh: {best['method']} = {best['id_mean']:.4f} ± {best['id_se']:.4f}")
 
     # ---- Paired test: BlurLIG vs cac method con lai (tren hieu so per-image) ----
     ref = "BlurLIG"

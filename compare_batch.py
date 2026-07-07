@@ -30,7 +30,7 @@ from pea.insdel import insertion_deletion
 from pea.methods import ig_single, eg, sba, sba_d
 from pea.blur_lig import blur_lig
 from pea.blur_lig_full import blur_lig_full, make_fvals_fn
-from pea.diffusion_path import diffusion_ig, diffusion_pf, diffusion_ig_multiref
+from pea.diffusion_path import diffusion_ig, diffusion_pf, diffusion_ig_multiref, diffusion_forward
 from pea.estimator import path_ensemble_attribution
 from pea.schedules import make_patch_groups
 
@@ -66,6 +66,10 @@ def parse_args():
     ap.add_argument("--diff_sigma_min", type=float, default=1.0, help="blur nhe nhat (pixel) cho Diffusion-MultiRef")
     ap.add_argument("--diff_sigma_max", type=float, default=25.0, help="blur nang nhat (pixel) cho Diffusion-MultiRef")
     ap.add_argument("--no_multiref", action="store_true", help="BO Diffusion-MultiRef")
+    ap.add_argument("--fwd_P", type=int, default=4, help="so mau nhieu cho Diffusion-Forward (bai toan nguoc)")
+    ap.add_argument("--fwd_tmax", type=float, default=0.9, help="muc nhieu cuc dai cho Diffusion-Forward (0..1)")
+    ap.add_argument("--fwd_lig", action="store_true", help="Diffusion-Forward dung LIG-measure thay vi uniform")
+    ap.add_argument("--no_forward", action="store_true", help="BO Diffusion-Forward")
     ap.add_argument("--chunk", type=int, default=16)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--seed", type=int, default=0)
@@ -134,6 +138,15 @@ def attributions_for_image(x, grad_fn, args, device, seed, model, target):
             R=args.diff_R, sigma_min=args.diff_sigma_min, sigma_max=args.diff_sigma_max,
             beta_min=args.diff_beta_min, beta_max=args.diff_beta_max,
             model=model, target=target, score=args.score,
+        )
+
+    # Diffusion-Forward: bai toan NGUOC — forward VP-noising tu ANH GOC, KHONG reference blur.
+    if not args.no_diffusion and not args.no_forward:
+        out["Diffusion-Forward"] = diffusion_forward(
+            x, grad_fn, N=args.N,
+            beta_min=args.diff_beta_min, beta_max=args.diff_beta_max,
+            P=args.fwd_P, t_max=args.fwd_tmax, use_lig=args.fwd_lig,
+            gen=gen, model=model, target=target, score=args.score,
         )
 
     # BlurLIG-Full (Algorithm 1 tren blur reference). Rat dat -> co the tat bang --no_lig_full.

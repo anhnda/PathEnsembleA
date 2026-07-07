@@ -54,6 +54,24 @@ def _bridge_anchor(t):
 
 
 # ---------------------------------------------------------------------------
+# blur_plain: de-blur reference, UNIFORM measure, Ito. Chinh la BlurIG viet lai
+# trong dung khung nay (cung _heat_ref, cung convention Ito left-point) de o
+# (de-blur x uniform) cua bang 2x2 khop chinh xac ngan sach/duong tich phan voi
+# cac o con lai — khong bi lech do IG-blur di code path khac.
+#   sigma=0, drift=0, uniform => day la goc BlurIG cua bang.
+# ---------------------------------------------------------------------------
+def blur_plain(x, blur_baseline, grad_fn, N):
+    """De-blur reference + uniform quadrature + Ito. = BlurIG trong khung nay. (3,H,W)."""
+    x0 = blur_baseline
+    T = max(2, N)
+    path = _heat_ref(x, x0, T)                 # (T+1,3,H,W)
+    g = grad_fn(path[:-1])                      # left-point (T,3,H,W)
+    with torch.no_grad():
+        dgamma = path[1:] - path[:-1]
+        return (g * dgamma).sum(dim=0)         # uniform Ito (moi buoc trong so 1)
+
+
+# ---------------------------------------------------------------------------
 # blur_bridge: heat reference + Follmer-lite drift huong tang f.
 #   Vong lap: tren reference de-blur path, moi buoc uoc luong grad g_k, roi day
 #   path ve chieu g_k (chuan hoa) mot luong ti le drift_scale * anchor(t) * ||dx||.
@@ -117,7 +135,7 @@ def blur_bridge(x, blur_baseline, grad_fn, N,
 #   => don ngan sach vao dung cac buoc f that su chuyen; bo qua ~90% buoc phang.
 # ---------------------------------------------------------------------------
 def blur_bridge_lig(x, blur_baseline, grad_fn, N,
-                    drift_scale=0.15, drift_iters=1,
+                    drift_scale=0.0, drift_iters=0,
                     fvals_fn=None, target=None, model=None, score="logit"):
     """
     Giong blur_bridge nhung dung LIG-measure thay cho quadrature deu.

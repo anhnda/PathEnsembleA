@@ -20,7 +20,9 @@ import torch
 from pea.resnet50_gradfn import load_resnet50, make_resnet50_gradfn, preprocess, IMAGENET_MEAN, IMAGENET_STD
 from pea.insdel import insertion_deletion
 from pea.methods import ig_single, eg, sba, sba_d
-from pea.blur_bridge import blur_bridge, blur_bridge_lig, blur_selfdiff, blur_selfdiff_lig
+from pea.blur_bridge import (
+    blur_bridge, blur_bridge_lig, blur_selfdiff, blur_selfdiff_lig, blur_plain,
+)
 from pea.estimator import path_ensemble_attribution
 from pea.schedules import make_patch_groups
 
@@ -119,18 +121,20 @@ def main():
         x, blur_baseline, grad_fn, N=N,
         drift_scale=args.bb_drift, drift_iters=args.bb_iters,
     )
-    # BlurBridge + LIG-measure: cung path, do bang mu_k ∝ |d_k| (don ngan sach vao buoc transition)
+    # ---- Bang 2x2 tach truc PATH (de-blur thang / self-diffusion) x MEASURE (uniform / LIG) ----
+    # o (de-blur thang x uniform) = BlurIG goc, viet trong dung khung nay:
+    attrs["BlurPlain"] = blur_plain(x, blur_baseline, grad_fn, N=N)
+    # o (de-blur thang x LIG) = LIG-measure tren path de-blur, drift=0 mac dinh (measure-only):
     attrs["BlurBridge+LIG"] = blur_bridge_lig(
         x, blur_baseline, grad_fn, N=N,
-        drift_scale=args.bb_drift, drift_iters=args.bb_iters,
         model=model, target=target, score=args.score,
     )
-    # SelfDiff: heat-correlated bridge noise quanh de-blur path (noise SONG tren manifold scale-space)
+    # o (self-diffusion x uniform):
     attrs["SelfDiff"] = blur_selfdiff(
         x, blur_baseline, grad_fn, N=N,
         sigma=args.sd_sigma, P=args.sd_P, ksize=args.sd_ksize, gen=gen,
     )
-    # SelfDiff + LIG-measure: cung path self-diffusion, do bang mu_k ∝ |d_k|
+    # o (self-diffusion x LIG):
     attrs["SelfDiff+LIG"] = blur_selfdiff_lig(
         x, blur_baseline, grad_fn, N=N,
         sigma=args.sd_sigma, P=args.sd_P, ksize=args.sd_ksize, gen=gen,

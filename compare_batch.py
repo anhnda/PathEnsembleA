@@ -30,6 +30,7 @@ from pea.insdel import insertion_deletion
 from pea.methods import ig_single, eg, sba, sba_d
 from pea.blur_lig import blur_lig
 from pea.blur_lig_full import blur_lig_full, make_fvals_fn
+from pea.diffusion_path import diffusion_ig, diffusion_pf
 from pea.estimator import path_ensemble_attribution
 from pea.schedules import make_patch_groups
 
@@ -53,6 +54,14 @@ def parse_args():
                     help="khoi tao BlurLIG-Full: 'blurlig' / 'straight'")
     ap.add_argument("--no_lig_full", action="store_true",
                     help="BO BlurLIG-Full (rat dat: O(T*N*N) eval/anh)")
+    # --- Diffusion-path (VP-SDE forward analytic + PF-ODE-style) ---
+    ap.add_argument("--diff_beta_min", type=float, default=0.1, help="beta_min lich VP cho Diffusion")
+    ap.add_argument("--diff_beta_max", type=float, default=20.0, help="beta_max lich VP cho Diffusion")
+    ap.add_argument("--diff_P", type=int, default=4, help="so lich nhieu lay ky vong cho Diffusion-IG")
+    ap.add_argument("--diff_jitter", type=float, default=0.02, help="lech luoi thoi gian giua cac lich (Diffusion-IG)")
+    ap.add_argument("--diff_score_scale", type=float, default=0.15, help="cuong do score-proxy de-blur cho Diffusion-PF (0 => VP thuan)")
+    ap.add_argument("--diff_no_lig", action="store_true", help="Diffusion-PF dung uniform Ito thay vi LIG-measure")
+    ap.add_argument("--no_diffusion", action="store_true", help="BO ca hai method Diffusion")
     ap.add_argument("--chunk", type=int, default=16)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--seed", type=int, default=0)
@@ -98,6 +107,21 @@ def attributions_for_image(x, grad_fn, args, device, seed, model, target):
     out["SBA-D"] = sba_d(x, baselines, grad_fn, N=args.N, gen=gen)
     out["BlurLIG"] = blur_lig(x, blur_baseline, grad_fn, N=args.N,
                               model=model, target=target, score=args.score)
+
+    # Diffusion-IG: VP-SDE ANALYTIC de-noising path (blur->x), lightweight, ky vong tren P lich nhieu.
+    # Diffusion-PF: PF-ODE-style path DETERMINISTIC (score-proxy = de-blur, blur=heat) + LIG-measure.
+    if not args.no_diffusion:
+        out["Diffusion-IG"] = diffusion_ig(
+            x, blur_baseline, grad_fn, N=args.N,
+            beta_min=args.diff_beta_min, beta_max=args.diff_beta_max,
+            P=args.diff_P, jitter=args.diff_jitter, gen=gen,
+        )
+        out["Diffusion-PF"] = diffusion_pf(
+            x, blur_baseline, grad_fn, N=args.N,
+            beta_min=args.diff_beta_min, beta_max=args.diff_beta_max,
+            score_scale=args.diff_score_scale, use_lig=not args.diff_no_lig,
+            model=model, target=target, score=args.score,
+        )
 
     # BlurLIG-Full (Algorithm 1 tren blur reference). Rat dat -> co the tat bang --no_lig_full.
     if not args.no_lig_full:

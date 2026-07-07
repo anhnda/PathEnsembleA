@@ -21,6 +21,7 @@ from pea.resnet50_gradfn import load_resnet50, make_resnet50_gradfn, preprocess,
 from pea.insdel import insertion_deletion
 from pea.methods import ig_single, eg, sba, sba_d
 from pea.blur_lig import blur_lig
+from pea.blur_lig_full import blur_lig_full, make_fvals_fn
 from pea.estimator import path_ensemble_attribution
 from pea.schedules import make_patch_groups
 
@@ -36,6 +37,9 @@ def parse_args():
     ap.add_argument("--grid", type=int, default=14, help="patch grid cho PEA")
     ap.add_argument("--L", type=int, default=6, help="so mode cosine cho PEA")
     ap.add_argument("--pea_P", type=int, default=25, help="so path cho PEA/Tube-EG")
+    ap.add_argument("--lig_T", type=int, default=10, help="so vong alternating cho BlurLIG-Full")
+    ap.add_argument("--lig_N", type=int, default=50, help="so buoc path cho BlurLIG-Full (nho vi Phase2 dat)")
+    ap.add_argument("--lig_exact_mu", action="store_true", help="Phase1 dung mu∝|d_k| thay vi QP")
     ap.add_argument("--chunk", type=int, default=16)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--seed", type=int, default=0)
@@ -110,9 +114,23 @@ def main():
         model=model, target=target, score=args.score,
     )
 
+    # BlurLIG-Full: LIG DAY DU (Algorithm 1) tren blur reference.
+    #   x0 = blur, path ban dau = duong thang blur->x, alternating: Phase1 measure QP + Phase2 grouped-velocity path.
+    #   Ngan sach: Phase 2 dat (probe finite-diff), nen dung lig_N nho + lig_T vong rieng.
+    C, H, W = x.shape
+    G_lig = args.grid * args.grid
+    gidx_lig = make_patch_groups(C, H, W, grid=args.grid).to(device)
+    fvals_fn = make_fvals_fn(model, target, device, chunk=args.chunk, score=args.score)
+    attrs["BlurLIG-Full"] = blur_lig_full(
+        x, blur_baseline, grad_fn, fvals_fn,
+        group_index=gidx_lig, G=G_lig, N=args.lig_N,
+        T=args.lig_T, lam=1.0, tau=0.01,
+        use_exact_measure=args.lig_exact_mu, generator=gen,
+        model=model, target=target, score=args.score,
+    )
+
     # PEA + Tube-EG (cung pool baseline, cung ngan sach N)
     # P path = pea_P; lap pool baseline cho du P; T = N // P de tong grad ~ N
-    C, H, W = x.shape
     P = args.pea_P
     reps = (P + baselines.shape[0] - 1) // baselines.shape[0]
     pea_baselines = blur_baseline.repeat(reps, 1, 1, 1)[:P]

@@ -190,3 +190,136 @@ def _resolve_fvals(fvals_fn, model, target, score, device):
             return F.log_softmax(logits, dim=1)[:, target]
         return logits[:, target]
     return _f
+
+
+# ===========================================================================
+# SELF-DIFFUSION blur bridge.
+#
+# Y tuong: blur CHINH LA heat diffusion (d L/d alpha = 1/4 lap L). Nen reference
+# process R cua Schrodinger bridge o ngach nay khong phai chon bua Brownian nhu
+# SBA — no la heat-semigroup, sinh ra tu chinh baseline. "Self-diffusion" nghia la:
+#   - reference     = de-blur path (blur_baseline -> x),
+#   - NOISE cua bridge cung nam trong ho scale-space: moi increment Brownian bridge
+#     duoc LOC qua chinh heat kernel (spatially-correlated), khong phai noise trang.
+# => moi trajectory trung gian van la 1 anh blur HOP LE (tren manifold scale-space),
+#    khac han SBA (noise trang -> off-manifold, path lom chom).
+#
+# Khong co drift theo grad (drift ∇f da chung minh la lam phang |d_k| va tut diem).
+# Self-diffusion chi kham pha QUANH path blur TRONG manifold, roi lay expectation (Ito).
+# Measure mu_k ∝ |d_k| van con transition sac de bam.
+#
+#   gamma_t = deblur(t)  +  sigma * anchor(t) * (G_a * xi_t)
+#   xi_t    = Brownian bridge trang (0 o 2 dau),  G_a * = heat/blur kernel
+#   sigma=0 => BlurIG.  Ito left-point.
+# ===========================================================================
+@torch.no_grad()
+def _heat_kernel1d(ksize, sigma_pix, device, dtype):
+    """1D Gaussian kernel (chuan hoa) de lam noise correlated theo scale-space."""
+    coords = torch.arange(ksize, device=device, dtype=dtype) - ksize // 2
+    g = torch.exp(-(coords ** 2) / (2.0 * sigma_pix ** 2))
+    return g / g.sum()
+
+
+@torch.no_grad()
+def _heat_smooth(v, k1d):
+    """v: (M,3,H,W) -> blur tach chieu bang k1d (heat kernel). Giu M,3,H,W."""
+    C = v.shape[1]
+    k = k1d.numel()
+    kx = k1d.view(1, 1, 1, k).repeat(C, 1, 1, 1)
+    ky = k1d.view(1, 1, k, 1).repeat(C, 1, 1, 1)
+    v = F.conv2d(v, kx, padding=(0, k // 2), groups=C)
+    v = F.conv2d(v, ky, padding=(k // 2, 0), groups=C)
+    return v
+
+
+@torch.no_grad()
+def _heat_bridge_noise(T, shape, sigma, ksize, sigma_pix, device, gen):
+    """
+    Brownian bridge (0 o 2 dau) nhung MOI increment duoc lam muot bang heat kernel
+    => noise spatially-correlated, song tren manifold scale-space. Tra (T+1,3,H,W).
+    """
+    dt = 1.0 / T
+    dW = torch.randn(T, *shape, generator=gen, device=device) * (dt ** 0.5)  # (T,3,H,W)
+    dW = _heat_smooth(dW, _heat_kernel1d(ksize, sigma_pix, device, dW.dtype))  # correlated
+    W = torch.cat([torch.zeros(1, *shape, device=device), dW.cumsum(dim=0)], dim=0)  # (T+1,...)
+    t = torch.linspace(0.0, 1.0, T + 1, device=device).view(-1, 1, 1, 1)
+    BB = W - t * W[-1:]                # bridge: 0 o t=0 va t=1
+    return sigma * BB                 # (T+1,3,H,W)
+
+
+def blur_selfdiff(x, blur_baseline, grad_fn, N,
+                  sigma=0.3, P=1, ksize=31, sigma_pix=None, gen=None):
+    """
+    Self-diffusion blur bridge: de-blur reference + heat-correlated bridge noise, Ito.
+    x, blur_baseline: (3,H,W). N: ngan sach grad. P: so trajectory (B*P*T ~ N).
+    sigma: bien do noise (0 => BlurIG). ksize/sigma_pix: heat kernel lam muot noise.
+    Tra ve attribution (3,H,W).
+    """
+    device = x.device
+    x0 = blur_baseline
+    T = max(2, N // max(1, P))
+    if sigma_pix is None:
+        sigma_pix = ksize / 3.0
+    shape = x.shape
+
+    ref = _heat_ref(x, x0, T)                              # (T+1,3,H,W) de-blur reference
+    t = torch.linspace(0.0, 1.0, T + 1, device=device)
+    anch = _bridge_anchor(t).view(-1, 1, 1, 1)            # 0 o 2 dau
+
+    acc = torch.zeros_like(x)
+    for _ in range(max(1, P)):
+        with torch.no_grad():
+            noise = _heat_bridge_noise(T, shape, sigma, ksize, sigma_pix, device, gen)
+            path = ref + anch * noise                    # (T+1,3,H,W), neo 2 dau
+            path[0] = x0; path[-1] = x
+        g = grad_fn(path[:-1])                            # left-point Ito, (T,3,H,W)
+        with torch.no_grad():
+            acc += (g * (path[1:] - path[:-1])).sum(dim=0)
+    return acc / max(1, P)
+
+
+def blur_selfdiff_lig(x, blur_baseline, grad_fn, N,
+                      sigma=0.3, P=1, ksize=31, sigma_pix=None, gen=None,
+                      model=None, target=None, score="logit"):
+    """
+    Self-diffusion path (nhu blur_selfdiff) nhung do bang LIG-measure mu_k ∝ |d_k|,
+    gop tren P trajectory (measure tinh tren path trung binh de co 1 mu_k on dinh).
+    Rescale completeness ve f(x)-f(x0) neu co (model,target).
+    """
+    device = x.device
+    x0 = blur_baseline
+    T = max(2, N // max(1, P))
+    if sigma_pix is None:
+        sigma_pix = ksize / 3.0
+    shape = x.shape
+
+    ref = _heat_ref(x, x0, T)
+    t = torch.linspace(0.0, 1.0, T + 1, device=device)
+    anch = _bridge_anchor(t).view(-1, 1, 1, 1)
+
+    # gop grad*dgamma va d_k tren P trajectory
+    acc_gd = torch.zeros(T, *shape, device=device)        # sum_P g_k*dgamma_k (per step)
+    acc_dk = torch.zeros(T, device=device)                # sum_P d_k
+    for _ in range(max(1, P)):
+        with torch.no_grad():
+            noise = _heat_bridge_noise(T, shape, sigma, ksize, sigma_pix, device, gen)
+            path = ref + anch * noise
+            path[0] = x0; path[-1] = x
+        g = grad_fn(path[:-1])                            # (T,3,H,W)
+        with torch.no_grad():
+            dgamma = path[1:] - path[:-1]
+            gd = g * dgamma                               # (T,3,H,W)
+            acc_gd += gd
+            acc_dk += gd.flatten(1).sum(dim=1)            # d_k per step
+
+    with torch.no_grad():
+        mu = acc_dk.abs()
+        mu = mu / (mu.sum() + 1e-12)                      # LIG-measure tren path trung binh
+        attr = (mu.view(-1, 1, 1, 1) * (acc_gd / max(1, P))).sum(dim=0)
+
+    fvals_fn = _resolve_fvals(None, model, target, score, device)
+    if fvals_fn is not None:
+        with torch.no_grad():
+            total = (fvals_fn(x[None]).reshape(()) - fvals_fn(x0[None]).reshape(()))
+            attr = attr * (total / (attr.sum() + 1e-12))
+    return attr

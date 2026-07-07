@@ -20,7 +20,7 @@ import torch
 from pea.resnet50_gradfn import load_resnet50, make_resnet50_gradfn, preprocess, IMAGENET_MEAN, IMAGENET_STD
 from pea.insdel import insertion_deletion
 from pea.methods import ig_single, eg, sba, sba_d
-from pea.blur_bridge import blur_bridge, blur_bridge_lig
+from pea.blur_bridge import blur_bridge, blur_bridge_lig, blur_selfdiff, blur_selfdiff_lig
 from pea.estimator import path_ensemble_attribution
 from pea.schedules import make_patch_groups
 
@@ -40,6 +40,12 @@ def parse_args():
                     help="cuong do drift cho blur-bridge (0 => thu ve BlurIG)")
     ap.add_argument("--bb_iters", type=int, default=1,
                     help="so vong tinh-chinh path bang grad-probe cho blur-bridge")
+    ap.add_argument("--sd_sigma", type=float, default=0.3,
+                    help="bien do heat-correlated noise cho self-diffusion (0 => BlurIG)")
+    ap.add_argument("--sd_P", type=int, default=4,
+                    help="so trajectory cho self-diffusion (B*P*T ~ N)")
+    ap.add_argument("--sd_ksize", type=int, default=31,
+                    help="kich thuoc heat kernel lam muot noise (scale-space)")
     ap.add_argument("--chunk", type=int, default=16)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--seed", type=int, default=0)
@@ -117,6 +123,17 @@ def main():
     attrs["BlurBridge+LIG"] = blur_bridge_lig(
         x, blur_baseline, grad_fn, N=N,
         drift_scale=args.bb_drift, drift_iters=args.bb_iters,
+        model=model, target=target, score=args.score,
+    )
+    # SelfDiff: heat-correlated bridge noise quanh de-blur path (noise SONG tren manifold scale-space)
+    attrs["SelfDiff"] = blur_selfdiff(
+        x, blur_baseline, grad_fn, N=N,
+        sigma=args.sd_sigma, P=args.sd_P, ksize=args.sd_ksize, gen=gen,
+    )
+    # SelfDiff + LIG-measure: cung path self-diffusion, do bang mu_k ∝ |d_k|
+    attrs["SelfDiff+LIG"] = blur_selfdiff_lig(
+        x, blur_baseline, grad_fn, N=N,
+        sigma=args.sd_sigma, P=args.sd_P, ksize=args.sd_ksize, gen=gen,
         model=model, target=target, score=args.score,
     )
 

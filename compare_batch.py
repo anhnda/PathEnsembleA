@@ -90,6 +90,111 @@ def mean_se(vals):
     return m, math.sqrt(var / n)  # standard error
 
 
+# ---------------------------------------------------------------------------
+# Paired stats tu luc — khong phu thuoc scipy. Tinh tren hieu so per-image
+# diff_k = a_k - b_k (a=BlurLIG, b=baseline), da ghep cap dung thu tu anh.
+# ---------------------------------------------------------------------------
+def _norm_cdf(z):
+    """CDF chuan tac qua erf."""
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def _t_sf(t, df):
+    """P(T>|t|)*2 (two-sided) cho phan phoi Student-t, xap xi.
+    Dung bien doi sang normal khi df lon; voi df nho dung cong thuc chuoi don gian.
+    Tra ve p-value hai phia."""
+    if df <= 0 or not math.isfinite(t):
+        return float("nan")
+    x = df / (df + t * t)
+    # regularized incomplete beta I_x(df/2, 1/2) = two-sided tail cua t (Abramowitz-Stegun tinh than)
+    # dung xap xi lien phan qua betacf; du chinh xac de bao cao p-value.
+    a, b = df / 2.0, 0.5
+    bt = math.exp(
+        math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+        + a * math.log(x) + b * math.log(1.0 - x)
+    ) if 0.0 < x < 1.0 else 0.0
+    # lien phan Lentz cho I_x(a,b)
+    def _betacf(x, a, b):
+        MAXIT, EPS, FPMIN = 200, 3e-12, 1e-300
+        qab, qap, qam = a + b, a + 1.0, a - 1.0
+        c = 1.0
+        d = 1.0 - qab * x / qap
+        if abs(d) < FPMIN: d = FPMIN
+        d = 1.0 / d
+        h = d
+        for m in range(1, MAXIT + 1):
+            m2 = 2 * m
+            aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+            d = 1.0 + aa * d
+            if abs(d) < FPMIN: d = FPMIN
+            c = 1.0 + aa / c
+            if abs(c) < FPMIN: c = FPMIN
+            d = 1.0 / d; h *= d * c
+            aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+            d = 1.0 + aa * d
+            if abs(d) < FPMIN: d = FPMIN
+            c = 1.0 + aa / c
+            if abs(c) < FPMIN: c = FPMIN
+            d = 1.0 / d; de = d * c; h *= de
+            if abs(de - 1.0) < EPS: break
+        return h
+    if x < (a + 1.0) / (a + b + 2.0):
+        ix = bt * _betacf(x, a, b) / a
+    else:
+        ix = 1.0 - bt * _betacf(1.0 - x, b, a) / b
+    return max(0.0, min(1.0, ix))  # = two-sided p cua t
+
+
+def paired_t(a, b):
+    """Paired t-test tren diff = a-b. Tra ve (mean_diff, t, p_two_sided)."""
+    d = [ai - bi for ai, bi in zip(a, b)]
+    n = len(d)
+    if n < 2:
+        return (float("nan"), float("nan"), float("nan"))
+    md = sum(d) / n
+    var = sum((x - md) ** 2 for x in d) / (n - 1)
+    sd = math.sqrt(var)
+    if sd == 0.0:
+        return (md, float("inf") if md != 0 else 0.0, 0.0 if md != 0 else 1.0)
+    t = md / (sd / math.sqrt(n))
+    return (md, t, _t_sf(t, n - 1))
+
+
+def wilcoxon(a, b):
+    """Wilcoxon signed-rank tren diff=a-b, normal approx co hieu chinh ties + zeros.
+    Tra ve (W, z, p_two_sided). Loai cac diff==0 (Pratt bo qua)."""
+    d = [ai - bi for ai, bi in zip(a, b) if ai - bi != 0.0]
+    n = len(d)
+    if n == 0:
+        return (float("nan"), float("nan"), float("nan"))
+    order = sorted(range(n), key=lambda i: abs(d[i]))
+    # gan rank co xu ly ties (trung binh rank)
+    ranks = [0.0] * n
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and abs(d[order[j + 1]]) == abs(d[order[i]]):
+            j += 1
+        avg = (i + 1 + j + 1) / 2.0  # rank 1-based trung binh
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg
+        i = j + 1
+    Wp = sum(ranks[i] for i in range(n) if d[i] > 0)
+    Wm = sum(ranks[i] for i in range(n) if d[i] < 0)
+    W = min(Wp, Wm)
+    mu = n * (n + 1) / 4.0
+    # hieu chinh ties cho phuong sai
+    from collections import Counter
+    tie_counts = Counter(abs(x) for x in d)
+    tie_term = sum(t ** 3 - t for t in tie_counts.values())
+    sigma2 = n * (n + 1) * (2 * n + 1) / 24.0 - tie_term / 48.0
+    if sigma2 <= 0:
+        return (W, float("nan"), float("nan"))
+    z = (W - mu + 0.5 * (1 if W < mu else -1)) / math.sqrt(sigma2)  # continuity correction
+    p = 2.0 * _norm_cdf(-abs(z))
+    return (W, z, p)
+
+
 def main():
     args = parse_args()
     device = args.device
@@ -175,6 +280,35 @@ def main():
     best = max(summary_rows, key=lambda r: r["id_mean"])
     print("-" * 74)
     print(f"[i] best I-D trung binh: {best['method']} = {best['id_mean']:.4f} ± {best['id_se']:.4f}")
+
+    # ---- Paired test: BlurLIG vs cac method con lai (tren hieu so per-image) ----
+    ref = "BlurLIG"
+    if ref in acc:
+        stat_rows = []
+        print("\n=== PAIRED TEST: {} vs cac method (n={} anh, ghep cap per-image) ===".format(ref, n_img))
+        print("Two-sided p. diff = {} - method. Ins/I-D: diff>0 co loi cho {}; Del: diff<0 co loi.".format(ref, ref))
+        for metric, key, better in [("Ins", "ins", "higher"),
+                                    ("Del", "del", "lower"),
+                                    ("I-D", "id", "higher")]:
+            print(f"\n-- {metric} ({'cao hon tot' if better=='higher' else 'thap hon tot'}) --")
+            print(f"{'vs method':<12}{'mean_diff':>12}{'t':>9}{'p(t)':>11}{'z(W)':>9}{'p(Wilcox)':>12}")
+            print("-" * 65)
+            a = acc[ref][key]
+            for m in metric_names:
+                if m == ref:
+                    continue
+                b = acc[m][key]
+                md, t, pt = paired_t(a, b)
+                W, z, pw = wilcoxon(a, b)
+                print(f"{m:<12}{md:>12.4f}{t:>9.3f}{pt:>11.4g}{z:>9.3f}{pw:>12.4g}")
+                stat_rows.append({
+                    "ref": ref, "vs": m, "metric": metric,
+                    "mean_diff": md, "t": t, "p_t": pt, "z_wilcoxon": z, "p_wilcoxon": pw,
+                })
+        with open("paired_tests.csv", "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(stat_rows[0].keys()))
+            w.writeheader(); w.writerows(stat_rows)
+        print("\n[i] da luu -> paired_tests.csv")
 
     with open("results.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["image", "target", "method", "insertion", "deletion", "id_gap"])

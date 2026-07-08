@@ -66,8 +66,11 @@ def parse_args():
     ap.add_argument("--floor", type=float, default=1e-6, help="ridge floor lambda cho Sigma")
     ap.add_argument("--test_size", type=float, default=0.3)
     ap.add_argument("--limit", type=int, default=None, help="chi danh gia N mau test dau")
-    ap.add_argument("--metric", type=str, default="soft", choices=["soft", "insdel"],
-                    help="soft = Soft-Faith (khong li voi feature tuong quan); insdel = conditional ins/del")
+    ap.add_argument("--metric", type=str, default="insdel", choices=["insdel", "soft"],
+                    help="insdel = insertion/deletion remove-to-zero (mac dinh, hop tabular); "
+                         "soft = Soft-Faith (KHONG hop tabular 1-chieu du thua, chi de tham khao)")
+    ap.add_argument("--insdel_mode", type=str, default="zero", choices=["zero", "conditional"],
+                    help="zero = remove ve 0 (marginal, nhay); conditional = Gaussian cond mean (co the li)")
     ap.add_argument("--n_soft", type=int, default=20, help="so mau Bernoulli cho soft metric")
     ap.add_argument("--insdel_steps", type=int, default=None, help="so buoc ins/del (mac dinh D)")
     ap.add_argument("--score", type=str, default="softmax", choices=["logit", "softmax"])
@@ -176,9 +179,8 @@ def main():
     methods += ["PM-IG-PPCA"]
     print(f"[i] PM-IG-PPCA psi(estimated) = {psi:.4f}  (rank q={min(args.ppca_q, D-1)})")
     print(f"[i] metric = {args.metric}"
-          + ("  (Soft-Faith: khong li voi feature tuong quan, khong can group)\n"
-             if args.metric == "soft"
-             else "  (conditional insertion/deletion — co the LI khi feature tuong quan manh)\n"))
+          + (f"  (insertion/deletion remove-to-{args.insdel_mode})\n" if args.metric == "insdel"
+             else "  (Soft-Faith — KHONG hop tabular 1-chieu du thua, chi tham khao)\n"))
 
     table, gaps_by_method = {}, {}
     if args.metric == "soft":
@@ -196,7 +198,9 @@ def main():
             se = _bootstrap_se(gap_t, n_boot=args.n_boot, seed=args.seed)
             gaps_by_method[nm] = gaps
             table[nm] = {"soft_nc": sum(ncs) / len(ncs), "soft_ns": sum(nss) / len(nss),
-                         "id_gap": gap_t.mean().item(), "id_se": se}
+                         "id_gap": gap_t.mean().item(), "id_se": se,
+                         "rank_key": sum(ncs) / len(ncs),          # xep hang theo Soft-NC
+                         "nc_list": ncs}                            # cho paired test theo NC
             print(f"{nm:<20}{table[nm]['soft_nc']:>12.4f}{table[nm]['soft_ns']:>12.4f}"
                   f"{table[nm]['id_gap']:>12.4f}   ± {se:.4f}")
     else:
@@ -208,7 +212,8 @@ def main():
                 x = X_eval[i]
                 phi = attr_for(nm, x)
                 r = insertion_deletion_tabular(model, x, phi, imputer, steps=args.insdel_steps,
-                                               target=target, score=args.score)
+                                               target=target, score=args.score,
+                                               mode=args.insdel_mode)
                 ins.append(r["insertion_auc"]); dels.append(r["deletion_auc"]); gaps.append(r["id_gap"])
             gap_t = torch.tensor(gaps)
             se = _bootstrap_se(gap_t, n_boot=args.n_boot, seed=args.seed)

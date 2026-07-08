@@ -397,29 +397,43 @@ def fit_imputer(X: torch.Tensor) -> GaussImputer:
 
 @torch.no_grad()
 def insertion_deletion_tabular(model, x, phi, imputer: GaussImputer,
-                               steps=None, target=1, score="softmax"):
+                               steps=None, target=1, score="softmax",
+                               mode="zero", baseline_vec=None):
     """
-    Conditional-imputation insertion/deletion tren 1 mau (tabular).
+    Insertion/deletion tren 1 mau (tabular).
     - order feature theo |phi| giam dan.
-    - insertion: bat dau tat ca feature bi impute (conditional mean voi keep rong),
-      lan luot LO ra feature quan trong nhat (dat lai gia tri that), do score target.
-    - deletion : bat dau tu x day du, lan luot XOA feature quan trong nhat (impute).
-    AUC = trung binh score tren cac buoc. score='softmax' -> [0,1] (khop insdel.py).
-    Voi regression, score la output tho — nen dung classif cho E1 de AUC co nghia.
+    - insertion: bat dau tat ca feature = baseline, lan luot LO ra feature quan trong
+      nhat (dat lai gia tri that), do score target.
+    - deletion : bat dau tu x day du, lan luot XOA feature quan trong nhat (ve baseline).
+    mode:
+      "zero"       : feature bi xoa/an -> baseline_vec (mac dinh 0 = mean sau StandardScaler).
+                     Hard remove marginal — nhay, don gian, KHONG bi conditional mean tai tao
+                     feature tuong quan (dung cho tabular). imputer bi bo qua.
+      "conditional": feature bi xoa/an -> E[x_miss|x_keep] (Gaussian conditional mean).
+                     Ton trong tuong quan nhung CO THE LI khi feature tuong quan manh.
+    AUC = trung binh score tren cac buoc. score='softmax' -> [0,1].
     """
     D = x.shape[0]
     steps = steps or D
     order = torch.argsort(phi.abs(), descending=True)      # (D,)
     device = x.device
+    if baseline_vec is None:
+        baseline_vec = torch.zeros(D, device=device)       # 0 = mean sau StandardScaler
+
+    def fill(keep_mask):
+        if mode == "conditional":
+            return imputer.impute(x, keep_mask)
+        # zero/marginal: giu x o keep, con lai = baseline_vec
+        return torch.where(keep_mask, x, baseline_vec)
 
     ks = torch.linspace(0, D, steps + 1, device=device).round().long()
 
-    # INSERTION: keep = top-k feature quan trong; con lai impute
+    # INSERTION: keep = top-k feature quan trong; con lai = baseline
     ins_imgs = []
     for k in ks:
         keep = torch.zeros(D, dtype=torch.bool, device=device)
         keep[order[:k]] = True
-        ins_imgs.append(imputer.impute(x, keep))
+        ins_imgs.append(fill(keep))
     ins = score_target(model, torch.stack(ins_imgs), target=target, score=score)
 
     # DELETION: xoa dan top-k quan trong (keep = phan con lai)
@@ -427,7 +441,7 @@ def insertion_deletion_tabular(model, x, phi, imputer: GaussImputer,
     for k in ks:
         keep = torch.ones(D, dtype=torch.bool, device=device)
         keep[order[:k]] = False
-        del_imgs.append(imputer.impute(x, keep))
+        del_imgs.append(fill(keep))
     dele = score_target(model, torch.stack(del_imgs), target=target, score=score)
 
     return {"insertion_auc": ins.mean().item(),

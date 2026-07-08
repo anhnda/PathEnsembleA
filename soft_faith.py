@@ -101,7 +101,10 @@ def calculate_soft_sufficiency(nn_forward_func, model, input_embed, position_emb
         p_prime = _get_prob_from_embed(nn_forward_func, model, x_prime,
                                        position_embed, type_embed, attention_mask, pred_class)
         soft_s_vals.append(1.0 - max(0.0, p_full - p_prime))
-    return (float(np.mean(soft_s_vals)) - s_base) / denom
+    # khop repo goc (metrics.py): max(0, .) roi clip [0,1]. suff_y_zero -= 1e-4 tranh nan.
+    s_base_adj = s_base - 1e-4
+    norm = max(0.0, (float(np.mean(soft_s_vals)) - s_base_adj) / (1.0 - s_base_adj))
+    return float(np.clip(norm, 0.0, 1.0))
 
 
 def calculate_soft_comprehensiveness(nn_forward_func, model, input_embed, position_embed,
@@ -122,7 +125,10 @@ def calculate_soft_comprehensiveness(nn_forward_func, model, input_embed, positi
         p_prime = _get_prob_from_embed(nn_forward_func, model, x_prime,
                                        position_embed, type_embed, attention_mask, pred_class)
         soft_c_vals.append(max(0.0, p_full - p_prime))
-    return float(np.mean(soft_c_vals)) / denom
+    # khop repo goc (metrics.py): max(0, comp / (1-s0)) roi clip [0,1]; tranh chia 0.
+    denom_adj = denom if abs(denom) > 1e-9 else 1e-5
+    norm = max(0.0, float(np.mean(soft_c_vals)) / denom_adj)
+    return float(np.clip(norm, 0.0, 1.0))
 
 
 def calculate_soft_log_odds(nn_forward_func, model, input_embed, position_embed,

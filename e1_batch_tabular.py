@@ -43,7 +43,7 @@ from synthetic_e0 import (
     fit_reference, shrinkage_baseline, fit_ppca,
     ig_tabular, eg_tabular, MLP, score_target,
     make_tabular_gradfn, fit_imputer, insertion_deletion_tabular,
-    _bootstrap_se,
+    soft_faith_tabular, _bootstrap_se,
 )
 
 
@@ -66,6 +66,9 @@ def parse_args():
     ap.add_argument("--floor", type=float, default=1e-6, help="ridge floor lambda cho Sigma")
     ap.add_argument("--test_size", type=float, default=0.3)
     ap.add_argument("--limit", type=int, default=None, help="chi danh gia N mau test dau")
+    ap.add_argument("--metric", type=str, default="soft", choices=["soft", "insdel"],
+                    help="soft = Soft-Faith (khong li voi feature tuong quan); insdel = conditional ins/del")
+    ap.add_argument("--n_soft", type=int, default=20, help="so mau Bernoulli cho soft metric")
     ap.add_argument("--insdel_steps", type=int, default=None, help="so buoc ins/del (mac dinh D)")
     ap.add_argument("--score", type=str, default="softmax", choices=["logit", "softmax"])
     ap.add_argument("--n_boot", type=int, default=1000)
@@ -171,35 +174,59 @@ def main():
     methods += [f"EG-{K}" for K in args.eg_K]
     methods += [f"Shrinkage-IG@{t:g}" for t in args.tau_sweep]
     methods += ["PM-IG-PPCA"]
-    print(f"[i] PM-IG-PPCA psi(estimated) = {psi:.4f}  (rank q={min(args.ppca_q, D-1)})\n")
+    print(f"[i] PM-IG-PPCA psi(estimated) = {psi:.4f}  (rank q={min(args.ppca_q, D-1)})")
+    print(f"[i] metric = {args.metric}"
+          + ("  (Soft-Faith: khong li voi feature tuong quan, khong can group)\n"
+             if args.metric == "soft"
+             else "  (conditional insertion/deletion — co the LI khi feature tuong quan manh)\n"))
 
-    print(f"{'method':<20}{'insertion↑':>12}{'deletion↓':>12}{'I-D↑':>10}{'  (mean ± boot-SE)'}")
-    print("-" * 66)
     table, gaps_by_method = {}, {}
-    for nm in methods:
-        ins, dels, gaps = [], [], []
-        for i in range(X_eval.shape[0]):
-            x = X_eval[i]
-            phi = attr_for(nm, x)
-            r = insertion_deletion_tabular(model, x, phi, imputer, steps=args.insdel_steps,
-                                           target=target, score=args.score)
-            ins.append(r["insertion_auc"]); dels.append(r["deletion_auc"]); gaps.append(r["id_gap"])
-        gap_t = torch.tensor(gaps)
-        se = _bootstrap_se(gap_t, n_boot=args.n_boot, seed=args.seed)
-        gaps_by_method[nm] = gaps
-        table[nm] = {"insertion": sum(ins) / len(ins), "deletion": sum(dels) / len(dels),
-                     "id_gap": gap_t.mean().item(), "id_se": se}
-        print(f"{nm:<20}{table[nm]['insertion']:>12.4f}{table[nm]['deletion']:>12.4f}"
-              f"{table[nm]['id_gap']:>10.4f}   ± {se:.4f}")
+    if args.metric == "soft":
+        print(f"{'method':<20}{'Soft-NC↑':>12}{'Soft-NS↑':>12}{'Soft-gap↑':>12}{'  (gap ± boot-SE)'}")
+        print("-" * 68)
+        for nm in methods:
+            ncs, nss, gaps = [], [], []
+            for i in range(X_eval.shape[0]):
+                x = X_eval[i]
+                phi = attr_for(nm, x)
+                r = soft_faith_tabular(model, x, phi, mu, target=target,
+                                       score=args.score, n_samples=args.n_soft)
+                ncs.append(r["soft_nc"]); nss.append(r["soft_ns"]); gaps.append(r["soft_gap"])
+            gap_t = torch.tensor(gaps)
+            se = _bootstrap_se(gap_t, n_boot=args.n_boot, seed=args.seed)
+            gaps_by_method[nm] = gaps
+            table[nm] = {"soft_nc": sum(ncs) / len(ncs), "soft_ns": sum(nss) / len(nss),
+                         "id_gap": gap_t.mean().item(), "id_se": se}
+            print(f"{nm:<20}{table[nm]['soft_nc']:>12.4f}{table[nm]['soft_ns']:>12.4f}"
+                  f"{table[nm]['id_gap']:>12.4f}   ± {se:.4f}")
+    else:
+        print(f"{'method':<20}{'insertion↑':>12}{'deletion↓':>12}{'I-D↑':>10}{'  (mean ± boot-SE)'}")
+        print("-" * 66)
+        for nm in methods:
+            ins, dels, gaps = [], [], []
+            for i in range(X_eval.shape[0]):
+                x = X_eval[i]
+                phi = attr_for(nm, x)
+                r = insertion_deletion_tabular(model, x, phi, imputer, steps=args.insdel_steps,
+                                               target=target, score=args.score)
+                ins.append(r["insertion_auc"]); dels.append(r["deletion_auc"]); gaps.append(r["id_gap"])
+            gap_t = torch.tensor(gaps)
+            se = _bootstrap_se(gap_t, n_boot=args.n_boot, seed=args.seed)
+            gaps_by_method[nm] = gaps
+            table[nm] = {"insertion": sum(ins) / len(ins), "deletion": sum(dels) / len(dels),
+                         "id_gap": gap_t.mean().item(), "id_se": se}
+            print(f"{nm:<20}{table[nm]['insertion']:>12.4f}{table[nm]['deletion']:>12.4f}"
+                  f"{table[nm]['id_gap']:>10.4f}   ± {se:.4f}")
 
-    print("-" * 66)
+    gap_label = "Soft-gap" if args.metric == "soft" else "I-D"
+    print("-" * 68)
     best = max(table, key=lambda k: table[k]["id_gap"])
-    print(f"[i] best I-D: {best} = {table[best]['id_gap']:.4f} ± {table[best]['id_se']:.4f}")
+    print(f"[i] best {gap_label}: {best} = {table[best]['id_gap']:.4f} ± {table[best]['id_se']:.4f}")
 
-    # ---- Paired test: Shrinkage-IG(tau tot nhat) vs baseline (ghep cap per-sample) ----
+    # ---- Paired test: Shrinkage-IG(gap tot nhat) vs baseline (ghep cap per-sample) ----
     shr = [m for m in methods if m.startswith("Shrinkage-IG")]
     refm = max(shr, key=lambda m: table[m]["id_gap"]) if shr else best
-    print(f"\n=== PAIRED TEST: {refm} vs baseline (n={X_eval.shape[0]} mau) ===")
+    print(f"\n=== PAIRED TEST: {refm} vs baseline (n={X_eval.shape[0]} mau, metric={gap_label}) ===")
     print(f"{'vs method':<20}{'mean_diff':>12}{'t':>9}{'p(t)':>11}{'z(W)':>9}{'p(Wilcox)':>12}")
     print("-" * 73)
     from e1_batch_image import paired_t, wilcoxon     # dung chung stat tu luc
@@ -211,17 +238,19 @@ def main():
         md, t, pt = paired_t(a, b)
         W, z, pw = wilcoxon(a, b)
         print(f"{m:<20}{md:>12.4f}{t:>9.3f}{pt:>11.4g}{z:>9.3f}{pw:>12.4g}")
-        stat_rows.append({"ref": refm, "vs": m, "metric": "I-D",
+        stat_rows.append({"ref": refm, "vs": m, "metric": gap_label,
                           "mean_diff": md, "t": t, "p_t": pt, "z_wilcoxon": z, "p_wilcoxon": pw})
 
     with open(f"e1_tabular_{args.dataset}_paired.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(stat_rows[0].keys()))
         w.writeheader(); w.writerows(stat_rows)
     with open(f"e1_tabular_{args.dataset}_summary.csv", "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["method", "insertion", "deletion", "id_gap", "id_se"])
+        cols = (["method", "soft_nc", "soft_ns", "id_gap", "id_se"] if args.metric == "soft"
+                else ["method", "insertion", "deletion", "id_gap", "id_se"])
+        w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
         for m in methods:
-            w.writerow({"method": m, **{k: table[m][k] for k in ["insertion", "deletion", "id_gap", "id_se"]}})
+            w.writerow({"method": m, **{k: table[m][k] for k in cols if k != "method"}})
     print(f"\n[i] da luu -> e1_tabular_{args.dataset}_summary.csv, e1_tabular_{args.dataset}_paired.csv")
 
 

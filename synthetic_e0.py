@@ -435,6 +435,52 @@ def insertion_deletion_tabular(model, x, phi, imputer: GaussImputer,
             "id_gap": (ins.mean() - dele.mean()).item()}
 
 
+@torch.no_grad()
+def soft_faith_tabular(model, x, phi, mu, target=1, score="softmax", n_samples=20):
+    """
+    Soft-Faith cho TABULAR (Zhao-Aletras, bien the 1-chieu/feature).
+
+    Vi sao dung cho tabular tuong quan manh: KHONG xoa cung feature nao, KHONG conditional
+    mean (nen khong bi tai tao lai feature tuong quan lam deletion li), KHONG can biet
+    nhom truoc. Chi nhan Bernoulli mask theo attribution roi lay ky vong -> do "phan bo
+    attribution co khop muc do model dua vao tung feature khong".
+
+    Moi feature j: chuan hoa a_j = |phi_j| ve [0,1] (min-max).
+      suff : giu feature quan trong voi xac suat q=a_j; feature bi drop -> thay bang mu_j
+             (marginal mean = 0 sau StandardScaler, dong vai "zeroed"/OOD-nhe).
+      comp : drop feature quan trong (q=1-a_j).
+    Soft-NC = max(0, p_full - E[p_comp]) / (1 - S0);  Soft-NS = (E[soft_s]-S0)/(1-S0), clip [0,1].
+    S0 = sufficiency khi thay TOAN BO feature bang mu (baseline zeroed).
+    Tra ve dict(soft_nc, soft_ns, soft_gap) voi soft_gap = NC + NS - 1.
+    """
+    D = x.shape[0]
+    device = x.device
+    a = phi.abs()
+    a = (a - a.min()) / (a.max() - a.min() + 1e-9)          # (D,) in [0,1]
+
+    def prob(vec):
+        return score_target(model, vec, target=target, score=score).item()
+
+    p_full = prob(x)
+    p_zero = prob(mu)                                       # thay toan bo bang mu
+    s0 = 1.0 - max(0.0, p_full - p_zero)
+    denom = 1.0 - s0 if abs(1.0 - s0) > 1e-9 else 1e-5
+
+    soft_s, soft_c = [], []
+    g = torch.Generator(device=device if device != "cpu" else "cpu")
+    for _ in range(n_samples):
+        keep = torch.bernoulli(a)                          # 1 = giu (suff)
+        x_suff = torch.where(keep.bool(), x, mu)
+        drop = torch.bernoulli(a)                          # 1 = drop (comp)
+        x_comp = torch.where(drop.bool(), mu, x)
+        soft_s.append(1.0 - max(0.0, p_full - prob(x_suff)))
+        soft_c.append(max(0.0, p_full - prob(x_comp)))
+    s0_adj = s0 - 1e-4
+    nc = float(min(1.0, max(0.0, (sum(soft_c) / len(soft_c)) / denom)))
+    ns = float(min(1.0, max(0.0, ((sum(soft_s) / len(soft_s)) - s0_adj) / (1.0 - s0_adj))))
+    return {"soft_nc": nc, "soft_ns": ns, "soft_gap": nc + ns - 1.0}
+
+
 # ===========================================================================
 # (5) Runners
 # ===========================================================================

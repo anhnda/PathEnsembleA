@@ -115,7 +115,8 @@ def make_forward_func(model_type):
         emb = model.bert.embeddings.LayerNorm(emb)
         emb = model.bert.embeddings.dropout(emb)
         ext = model.get_extended_attention_mask(attention_mask, input_embed.shape[:-1])
-        enc = model.bert.encoder(emb, attention_mask=ext)[0]
+        n_layers = model.config.num_hidden_layers
+        enc = model.bert.encoder(emb, attention_mask=ext, head_mask=[None] * n_layers)[0]
         pooled = model.bert.pooler(enc) if model.bert.pooler is not None else enc[:, 0]
         return model.classifier(model.dropout(pooled) if hasattr(model, "dropout") else pooled)
 
@@ -125,7 +126,10 @@ def make_forward_func(model_type):
             emb = emb + position_embed
         emb = model.distilbert.embeddings.LayerNorm(emb)
         emb = model.distilbert.embeddings.dropout(emb)
-        enc = model.distilbert.transformer(emb, attn_mask=attention_mask)[0]
+        n_layers = model.config.num_hidden_layers
+        enc = model.distilbert.transformer(
+            x=emb, attn_mask=attention_mask, head_mask=[None] * n_layers,
+        )[0]
         pooled = enc[:, 0]                                 # [CLS]
         pooled = model.pre_classifier(pooled)
         pooled = torch.nn.ReLU()(pooled)
@@ -141,7 +145,8 @@ def make_forward_func(model_type):
         emb = model.roberta.embeddings.LayerNorm(emb)
         emb = model.roberta.embeddings.dropout(emb)
         ext = model.get_extended_attention_mask(attention_mask, input_embed.shape[:-1])
-        enc = model.roberta.encoder(emb, attention_mask=ext)[0]
+        n_layers = model.config.num_hidden_layers
+        enc = model.roberta.encoder(emb, attention_mask=ext, head_mask=[None] * n_layers)[0]
         return model.classifier(enc)                       # RobertaClassificationHead lay <s>
 
     return {"bert": fwd_bert, "distilbert": fwd_distilbert, "roberta": fwd_roberta}[model_type]

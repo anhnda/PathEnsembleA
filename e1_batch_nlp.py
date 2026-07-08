@@ -13,7 +13,8 @@ IG (embedding, dot-product form nhu yeu cau):
 
 Methods (chi IG + BASELINE, path thang — dung E1):
     IG-zero      : baseline = embedding 0
-    IG-pad       : baseline = embedding cua [PAD] (missingness "chuan" cua NLP)
+    IG-pad       : baseline = embedding cua [PAD]
+    IG-mask      : baseline = embedding cua [MASK] (in-distribution "token bi che" cua MLM)
     IG-mean      : baseline = mu (trung binh embedding tren reference set)
     IG-random    : baseline = 1 embedding sample ngau nhien tu reference set
     EG-K         : trung binh IG tren K embedding sample (ngan sach chia deu)  K in {1,4,16}
@@ -263,8 +264,13 @@ def main():
     mu = X_ref.mean(dim=0)                                  # (d,)
     print(f"[i] PM-IG-PPCA psi = {psi:.4f}  (rank q={min(args.ppca_q, X_ref.shape[1]-1)})")
 
-    # pad embedding (d,) — CHI dung cho baseline-IG "IG-pad" (missingness cua IG).
+    # pad + mask embedding (d,) — baseline-IG "missingness" chuan cua NLP.
     pad_emb_single = embed(torch.tensor([[tokenizer.pad_token_id]], device=device))[0, 0]  # (d,)
+    # [MASK] embedding: baseline "chuan nhat" cho BERT-family vi model duoc pretrain MLM
+    # tren [MASK] -> chuoi toan [MASK] la in-distribution "token bi che". Neu tokenizer
+    # khong co mask_token (hiem), fallback ve pad.
+    _mask_id = tokenizer.mask_token_id if tokenizer.mask_token_id is not None else tokenizer.pad_token_id
+    mask_emb_single = embed(torch.tensor([[_mask_id]], device=device))[0, 0]                # (d,)
     # S(X,y,0) cua soft_faith = "zeroed out sequence" (Eq.1 Zhao-Aletras 2023), KHONG phai
     # PAD, KHONG phai mu. Day chi la HANG SO CHUAN HOA per-cau (mau so 1-S(X,y,0)), giong
     # nhau cho MOI method tren cung 1 cau -> de base_token_emb=None de soft_faith tu tao
@@ -276,7 +282,7 @@ def main():
     rand_idx = torch.randperm(X_ref.shape[0], generator=g)[:max(args.eg_K)]
     rand_pool = X_ref[rand_idx]                             # (maxK, d)
 
-    methods = ["IG-zero", "IG-pad", "IG-mean", "IG-random"]
+    methods = ["IG-zero", "IG-pad", "IG-mask", "IG-mean", "IG-random"]
     methods += [f"EG-{K}" for K in args.eg_K]
     methods += [f"Shrinkage-IG@{t:g}" for t in args.tau_sweep]
     methods += ["PM-IG-PPCA"]
@@ -288,6 +294,8 @@ def main():
             return torch.zeros_like(word_embed)
         if name == "IG-pad":
             return pad_emb_single.view(1, 1, -1).expand(1, seq, -1).contiguous()
+        if name == "IG-mask":
+            return mask_emb_single.view(1, 1, -1).expand(1, seq, -1).contiguous()
         if name == "IG-mean":
             return mu.view(1, 1, -1).expand(1, seq, -1).contiguous()
         if name == "IG-random":

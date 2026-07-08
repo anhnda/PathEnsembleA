@@ -57,7 +57,7 @@ from soft_faith import (
     calculate_soft_comprehensiveness,
     calculate_soft_log_odds,
 )
-from e1_batch_image import paired_t, wilcoxon, mean_se   # dung chung stat tu luc
+from stats_utils import paired_t, wilcoxon, mean_se   # module stat doc lap
 
 
 MODEL_MAP = {

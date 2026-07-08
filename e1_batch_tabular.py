@@ -71,6 +71,8 @@ def parse_args():
                          "soft = Soft-Faith (KHONG hop tabular 1-chieu du thua, chi de tham khao)")
     ap.add_argument("--insdel_mode", type=str, default="zero", choices=["zero", "conditional"],
                     help="zero = remove ve 0 (marginal, nhay); conditional = Gaussian cond mean (co the li)")
+    ap.add_argument("--rand_seeds", type=int, default=5,
+                    help="so seed cho baseline ngau nhien (IG-random/EG) — bao cao mean±std de kh khoi may rui")
     ap.add_argument("--n_soft", type=int, default=20, help="so mau Bernoulli cho soft metric")
     ap.add_argument("--insdel_steps", type=int, default=None, help="so buoc ins/del (mac dinh D)")
     ap.add_argument("--score", type=str, default="softmax", choices=["logit", "softmax"])
@@ -158,20 +160,31 @@ def main():
 
     N = args.N
 
-    def attr_for(name, x):
+    def rand_pool_for(rng_seed):
+        gg = torch.Generator(device="cpu"); gg.manual_seed(rng_seed)
+        idx = torch.randperm(Xtr.shape[0], generator=gg)[:max(args.eg_K)]
+        return Xtr[idx]
+
+    def attr_for(name, x, rng_seed=None):
         if name == "IG-zero":   return ig_tabular(x, zero, grad_fn, T=N)
         if name == "IG-mean":   return ig_tabular(x, mu, grad_fn, T=N)
         if name == "IG-median": return ig_tabular(x, med, grad_fn, T=N)
-        if name == "IG-random": return ig_tabular(x, rand_pool[0], grad_fn, T=N)
+        if name == "IG-random":
+            pool = rand_pool_for(rng_seed if rng_seed is not None else args.seed + 5)
+            return ig_tabular(x, pool[0], grad_fn, T=N)
         if name.startswith("EG-"):
             K = int(name.split("-")[1])
-            return eg_tabular(x, rand_pool[:K], grad_fn, N=N)
+            pool = rand_pool_for(rng_seed if rng_seed is not None else args.seed + 5)
+            return eg_tabular(x, pool[:K], grad_fn, N=N)
         if name.startswith("Shrinkage-IG@"):
             tau = float(name.split("@")[1])
             return ig_tabular(x, shrinkage_baseline(x, ref, tau=tau), grad_fn, T=N)
         if name == "PM-IG-PPCA":
             return ig_tabular(x, shrinkage_baseline(x, ppca_ref, tau=psi), grad_fn, T=N)
         raise ValueError(name)
+
+    def is_stochastic(name):
+        return name == "IG-random" or name.startswith("EG-")
 
     methods = ["IG-zero", "IG-mean", "IG-median", "IG-random"]
     methods += [f"EG-{K}" for K in args.eg_K]
@@ -204,24 +217,39 @@ def main():
             print(f"{nm:<20}{table[nm]['soft_nc']:>12.4f}{table[nm]['soft_ns']:>12.4f}"
                   f"{table[nm]['id_gap']:>12.4f}   ± {se:.4f}")
     else:
-        print(f"{'method':<20}{'insertion↑':>12}{'deletion↓':>12}{'I-D↑':>10}{'  (mean ± boot-SE)'}")
-        print("-" * 66)
+        print(f"{'method':<20}{'insertion↑':>12}{'deletion↓':>12}{'I-D↑':>10}"
+              f"{'  (mean ± boot-SE [± seed-std])'}")
+        print("-" * 74)
         for nm in methods:
-            ins, dels, gaps = [], [], []
-            for i in range(X_eval.shape[0]):
-                x = X_eval[i]
-                phi = attr_for(nm, x)
-                r = insertion_deletion_tabular(model, x, phi, imputer, steps=args.insdel_steps,
-                                               target=target, score=args.score,
-                                               mode=args.insdel_mode)
-                ins.append(r["insertion_auc"]); dels.append(r["deletion_auc"]); gaps.append(r["id_gap"])
-            gap_t = torch.tensor(gaps)
-            se = _bootstrap_se(gap_t, n_boot=args.n_boot, seed=args.seed)
-            gaps_by_method[nm] = gaps
-            table[nm] = {"insertion": sum(ins) / len(ins), "deletion": sum(dels) / len(dels),
-                         "id_gap": gap_t.mean().item(), "id_se": se}
+            seeds = list(range(args.rand_seeds)) if is_stochastic(nm) else [None]
+            # gap per-sample TRUNG BINH qua seed (de paired test), + seed-level I-D de bao variance
+            per_sample_gap = None
+            seed_id_means = []
+            ins_all, del_all = [], []
+            for sd in seeds:
+                rs = (args.seed + 1000 + sd) if sd is not None else None
+                ins, dels, gaps = [], [], []
+                for i in range(X_eval.shape[0]):
+                    x = X_eval[i]
+                    phi = attr_for(nm, x, rng_seed=rs)
+                    r = insertion_deletion_tabular(model, x, phi, imputer, steps=args.insdel_steps,
+                                                   target=target, score=args.score, mode=args.insdel_mode)
+                    ins.append(r["insertion_auc"]); dels.append(r["deletion_auc"]); gaps.append(r["id_gap"])
+                gaps_t = torch.tensor(gaps)
+                per_sample_gap = gaps_t if per_sample_gap is None else per_sample_gap + gaps_t
+                seed_id_means.append(gaps_t.mean().item())
+                ins_all.append(sum(ins) / len(ins)); del_all.append(sum(dels) / len(dels))
+            per_sample_gap = per_sample_gap / len(seeds)          # trung binh qua seed
+            se = _bootstrap_se(per_sample_gap, n_boot=args.n_boot, seed=args.seed)
+            seed_std = float(torch.tensor(seed_id_means).std().item()) if len(seeds) > 1 else 0.0
+            gaps_by_method[nm] = per_sample_gap.tolist()
+            table[nm] = {"insertion": sum(ins_all) / len(ins_all),
+                         "deletion": sum(del_all) / len(del_all),
+                         "id_gap": per_sample_gap.mean().item(), "id_se": se,
+                         "seed_std": seed_std, "n_seeds": len(seeds)}
+            tail = f"   ± {se:.4f}" + (f"  [seed-std {seed_std:.4f}, n={len(seeds)}]" if len(seeds) > 1 else "")
             print(f"{nm:<20}{table[nm]['insertion']:>12.4f}{table[nm]['deletion']:>12.4f}"
-                  f"{table[nm]['id_gap']:>10.4f}   ± {se:.4f}")
+                  f"{table[nm]['id_gap']:>10.4f}{tail}")
 
     gap_label = "Soft-gap" if args.metric == "soft" else "I-D"
     print("-" * 68)
@@ -234,7 +262,7 @@ def main():
     print(f"\n=== PAIRED TEST: {refm} vs baseline (n={X_eval.shape[0]} mau, metric={gap_label}) ===")
     print(f"{'vs method':<20}{'mean_diff':>12}{'t':>9}{'p(t)':>11}{'z(W)':>9}{'p(Wilcox)':>12}")
     print("-" * 73)
-    from e1_batch_image import paired_t, wilcoxon     # dung chung stat tu luc
+    from stats_utils import paired_t, wilcoxon     # module stat doc lap (khong keo torchvision)
     stat_rows = []
     a = gaps_by_method[refm]
     for m in methods:

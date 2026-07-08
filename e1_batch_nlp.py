@@ -21,9 +21,13 @@ Methods (chi IG + BASELINE, path thang — dung E1):
     PM-IG-PPCA   : psi uoc luong (Cor. MMSE), khong ridge floor
 
 Danh gia: SOFT-FAITHFULNESS (Zhao & Aletras 2023, soft_faith.py):
-    Soft-NC (comprehensiveness, cao=tot), Soft-NS (sufficiency, cao=tot),
-    Soft-log-odds (cao=tot). KHONG tai dung baseline lam mask (soft Bernoulli dropout
-    theo attribution, doc lap voi baseline IG).
+    Soft-NC (xoa mem token quan trong -> prob sap; cao=tot),
+    Soft-NS (giu mem token quan trong -> prob dung vung; cao=tot),
+    Soft-gap = NC + NS - 1 (gop hai chieu, kieu I-D gap; cao=faithful),
+    Soft-log-odds (cao=tot).
+    NC va NS la CAP DOI VE HANH VI (xoa-quan-trong vs giu-quan-trong tren CUNG
+    attribution) — faithful can CA HAI cao, nen xep hang theo Soft-gap.
+    KHONG tai dung baseline lam mask (soft Bernoulli dropout theo attribution).
 
 Model pretrain (BERT/DistilBERT/RoBERTa fine-tuned), dataset mac dinh sst2 test.
 Batch: lay mau `--limit` cau (mac dinh 50). Paired test Shrinkage(tau tot) vs baseline.
@@ -259,10 +263,14 @@ def main():
     mu = X_ref.mean(dim=0)                                  # (d,)
     print(f"[i] PM-IG-PPCA psi = {psi:.4f}  (rank q={min(args.ppca_q, X_ref.shape[1]-1)})")
 
-    # baseline token embedding cho soft metric (base_token_emb = mu, (1,d))
-    base_token_emb = mu.unsqueeze(0)                        # (1,d)
-    # pad embedding cho IG-pad
+    # pad embedding (d,) — CHI dung cho baseline-IG "IG-pad" (missingness cua IG).
     pad_emb_single = embed(torch.tensor([[tokenizer.pad_token_id]], device=device))[0, 0]  # (d,)
+    # S(X,y,0) cua soft_faith = "zeroed out sequence" (Eq.1 Zhao-Aletras 2023), KHONG phai
+    # PAD, KHONG phai mu. Day chi la HANG SO CHUAN HOA per-cau (mau so 1-S(X,y,0)), giong
+    # nhau cho MOI method tren cung 1 cau -> de base_token_emb=None de soft_faith tu tao
+    # zeros_like(input_embed). Perturbation X' (Eq.3-5) la Bernoulli mask nhan thang len
+    # embedding theo attribution, KHONG chen baseline nao vao.
+    base_token_emb = None
 
     g = torch.Generator(device="cpu"); g.manual_seed(args.seed + 5)
     rand_idx = torch.randperm(X_ref.shape[0], generator=g)[:max(args.eg_K)]
@@ -360,33 +368,42 @@ def main():
         if (si + 1) % 5 == 0 or si + 1 == len(sample):
             print(f"[{si+1}/{len(sample)}] done")
 
-    # ---- bang tong hop (mean±SE) ----
+    # ---- bang tong hop (mean±SE). Soft-gap = NC + NS - 1 (kieu I-D gap cua NLP) ----
+    # Soft-NC↑ (xoa quan trong -> sap manh), Soft-NS↑ (giu quan trong -> dung vung).
+    # Faithful can CA HAI cao. Gop lai: Soft-gap = NC + NS - 1  (cang cao cang faithful).
     n = len(sample)
-    print(f"\n{'='*82}\nKET QUA E1-NLP tren {n} cau  ({args.model}/{args.dataset})")
-    print(f"{'method':<20}{'Soft-NC↑':>16}{'Soft-NS↑':>16}{'Soft-logodds↑':>18}")
-    print("-" * 82)
-    best_nc, best_m = -float("inf"), None
+    for m in methods:
+        acc[m]["soft_gap"] = [nc + ns - 1.0
+                              for nc, ns in zip(acc[m]["soft_nc"], acc[m]["soft_ns"])]
+    print(f"\n{'='*96}\nKET QUA E1-NLP tren {n} cau  ({args.model}/{args.dataset})")
+    print(f"{'method':<20}{'Soft-NC↑':>15}{'Soft-NS↑':>15}{'Soft-gap↑':>15}{'Soft-logodds↑':>18}")
+    print("-" * 96)
+    best_gap, best_m = -float("inf"), None
     summary_rows = []
     for m in methods:
         nc_m, nc_se = mean_se(acc[m]["soft_nc"])
         ns_m, ns_se = mean_se(acc[m]["soft_ns"])
+        gp_m, gp_se = mean_se(acc[m]["soft_gap"])
         lo_m, lo_se = mean_se(acc[m]["soft_logodds"])
-        if nc_m > best_nc:
-            best_nc, best_m = nc_m, m
-        print(f"{m:<20}{nc_m:>8.4f}±{nc_se:<6.4f}{ns_m:>8.4f}±{ns_se:<6.4f}{lo_m:>10.4f}±{lo_se:<6.4f}")
+        if gp_m > best_gap:
+            best_gap, best_m = gp_m, m
+        print(f"{m:<20}{nc_m:>8.4f}±{nc_se:<5.4f}{ns_m:>8.4f}±{ns_se:<5.4f}"
+              f"{gp_m:>8.4f}±{gp_se:<5.4f}{lo_m:>10.4f}±{lo_se:<6.4f}")
         summary_rows.append({"method": m, "n": n,
                              "soft_nc_mean": nc_m, "soft_nc_se": nc_se,
                              "soft_ns_mean": ns_m, "soft_ns_se": ns_se,
+                             "soft_gap_mean": gp_m, "soft_gap_se": gp_se,
                              "soft_logodds_mean": lo_m, "soft_logodds_se": lo_se})
-    print("-" * 82)
-    print(f"[i] dan dau Soft-NC: {best_m} = {best_nc:.4f}")
+    print("-" * 96)
+    print(f"[i] dan dau Soft-gap (=NC+NS-1): {best_m} = {best_gap:.4f}")
 
-    # ---- Paired test: Shrinkage(tot nhat theo Soft-NC) vs baseline ----
+    # ---- Paired test: Shrinkage(tot nhat theo Soft-gap) vs baseline ----
     shr = [m for m in methods if m.startswith("Shrinkage-IG")]
-    refm = max(shr, key=lambda m: mean_se(acc[m]["soft_nc"])[0]) if shr else best_m
+    refm = max(shr, key=lambda m: mean_se(acc[m]["soft_gap"])[0]) if shr else best_m
     print(f"\n=== PAIRED TEST: {refm} vs baseline (n={n} cau, ghep cap per-sentence) ===")
     stat_rows = []
-    for metric, key in [("Soft-NC", "soft_nc"), ("Soft-NS", "soft_ns"), ("Soft-logodds", "soft_logodds")]:
+    for metric, key in [("Soft-NC", "soft_nc"), ("Soft-NS", "soft_ns"),
+                        ("Soft-gap", "soft_gap"), ("Soft-logodds", "soft_logodds")]:
         print(f"\n-- {metric} (cao hon tot) --")
         print(f"{'vs method':<20}{'mean_diff':>12}{'t':>9}{'p(t)':>11}{'z(W)':>9}{'p(Wilcox)':>12}")
         print("-" * 73)

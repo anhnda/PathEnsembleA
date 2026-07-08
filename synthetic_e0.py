@@ -193,29 +193,64 @@ def sample_regime(reg: Regime, n: int, device, seed: int):
 
 
 class MLP(nn.Module):
-    """MLP kha vi nho — chi de model HOC ham target that roi lay gradient IG."""
-    def __init__(self, D, hidden=128):
+    """
+    MLP kha vi nho. n_out=1: regression (E0, target lien tuc de test bias phuong sai).
+    n_out=2: classification (E1, khop draft E2 + insdel.py softmax in [0,1]).
+    forward luon tra (M, n_out); helper score_target(...) chon logit/softmax lop target.
+    """
+    def __init__(self, D, hidden=128, n_out=1):
         super().__init__()
+        self.n_out = n_out
         self.net = nn.Sequential(
             nn.Linear(D, hidden), nn.GELU(),
             nn.Linear(hidden, hidden), nn.GELU(),
-            nn.Linear(hidden, 1),
+            nn.Linear(hidden, n_out),
         )
 
     def forward(self, x):
-        return self.net(x).squeeze(-1)
+        return self.net(x)                                # (M, n_out)
 
 
-def train_model(reg: Regime, device, seed: int, n_train=8000, epochs=300, lr=1e-3):
+def score_target(model, x, target=1, score="softmax"):
     """
-    Fit MLP -> y_true tren regime. Tra ve model.eval() da .to(device).
-    Chi de co model kha vi khop ham that; day KHONG phai benchmark, chi chuan bi E0.
+    Score vo huong duoc dung CHUNG cho attribution backward va metric.
+      regression (n_out=1): tra output vo huong (target bo qua).
+      classification (n_out=2): logit hoac softmax cua lop `target`.
+    x: (M,D) hoac (D,). Tra ve (M,) hoac scalar.
+    """
+    single = (x.dim() == 1)
+    out = model(x[None] if single else x)                 # (M, n_out)
+    if model.n_out == 1:
+        s = out.squeeze(-1)
+    elif score == "logit":
+        s = out[:, target]
+    else:
+        s = F.softmax(out, dim=1)[:, target]
+    return s[0] if single else s
+
+
+def train_model(reg: Regime, device, seed: int, n_train=8000, epochs=300, lr=1e-3,
+                task="regression"):
+    """
+    Fit MLP tren regime. task='regression' -> MSE toi y_true (E0).
+    task='classif' -> nhan nhi phan y_bin = (y > median), CrossEntropy (E1).
+    Tra ve model.eval() da .to(device).
     """
     Xtr, ytr = sample_regime(reg, n_train, device, seed + 1)
-    # chuan hoa target de loss on dinh (khong doi driver ranking)
-    ymu, ysd = ytr.mean(), ytr.std().clamp_min(1e-6)
-    ytr_n = (ytr - ymu) / ysd
-    model = MLP(reg.D).to(device)
+    if task == "classif":
+        thresh = ytr.median()
+        ybin = (ytr > thresh).long()
+        model = MLP(reg.D, n_out=2).to(device)
+        loss_fn = lambda pred, tgt: F.cross_entropy(pred, tgt)
+        y_used = ybin
+        model._thresh = float(thresh)
+    else:
+        ymu, ysd = ytr.mean(), ytr.std().clamp_min(1e-6)
+        y_used = (ytr - ymu) / ysd
+        model = MLP(reg.D, n_out=1).to(device)
+        loss_fn = lambda pred, tgt: F.mse_loss(pred.squeeze(-1), tgt)
+        model._ymu, model._ysd = float(ymu), float(ysd)
+
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     model.train()
     bs = 512
@@ -224,11 +259,10 @@ def train_model(reg: Regime, device, seed: int, n_train=8000, epochs=300, lr=1e-
         for i in range(0, Xtr.shape[0], bs):
             idx = perm[i:i + bs]
             pred = model(Xtr[idx])
-            loss = F.mse_loss(pred, ytr_n[idx])
+            loss = loss_fn(pred, y_used[idx])
             opt.zero_grad(); loss.backward(); opt.step()
     model.eval()
-    # gan meta chuan hoa de score nhat quan (khong bat buoc dung)
-    model._ymu, model._ysd = float(ymu), float(ysd)
+    model._task = task
     return model
 
 
@@ -236,16 +270,19 @@ def train_model(reg: Regime, device, seed: int, n_train=8000, epochs=300, lr=1e-
 # (2) IG tren tabular (dung CHUNG midpoint rule voi methods.py: ig_single).
 #   grad_fn(states (M,D)) -> grads (M,D) qua autograd cua model (scalar output).
 # ===========================================================================
-def make_tabular_gradfn(model, device, chunk=4096):
-    """grad d model(x)/dx cho batch (M,D). Model output scalar-per-row."""
+def make_tabular_gradfn(model, device, chunk=4096, target=1, score="softmax"):
+    """
+    grad d score_target(x)/dx cho batch (M,D). Dung CHUNG score voi metric.
+    regression: grad output; classification: grad logit/softmax lop target.
+    """
     def grad_fn(states: torch.Tensor) -> torch.Tensor:
         out = torch.empty_like(states)
         for i in range(0, states.shape[0], chunk):
             sb = states[i:i + chunk].to(device).clone().requires_grad_(True)
-            score = model(sb).sum()
-            grad, = torch.autograd.grad(score, sb)
+            s = score_target(model, sb, target=target, score=score).sum()
+            grad, = torch.autograd.grad(s, sb)
             out[i:i + chunk] = grad.detach()
-            del sb, score, grad
+            del sb, s, grad
         return out
     return grad_fn
 
@@ -359,15 +396,16 @@ def fit_imputer(X: torch.Tensor) -> GaussImputer:
 
 
 @torch.no_grad()
-def insertion_deletion_tabular(model, x, phi, imputer: GaussImputer, steps=None):
+def insertion_deletion_tabular(model, x, phi, imputer: GaussImputer,
+                               steps=None, target=1, score="softmax"):
     """
     Conditional-imputation insertion/deletion tren 1 mau (tabular).
     - order feature theo |phi| giam dan.
     - insertion: bat dau tat ca feature bi impute (conditional mean voi keep rong),
-      lan luot LO ra feature quan trong nhat (dat lai gia tri that), do model output.
+      lan luot LO ra feature quan trong nhat (dat lai gia tri that), do score target.
     - deletion : bat dau tu x day du, lan luot XOA feature quan trong nhat (impute).
-    AUC = trung binh output tren cac buoc. I-D gap = ins_auc - del_auc.
-    Output dung score model tho (nhat quan voi attribution backward).
+    AUC = trung binh score tren cac buoc. score='softmax' -> [0,1] (khop insdel.py).
+    Voi regression, score la output tho — nen dung classif cho E1 de AUC co nghia.
     """
     D = x.shape[0]
     steps = steps or D
@@ -382,7 +420,7 @@ def insertion_deletion_tabular(model, x, phi, imputer: GaussImputer, steps=None)
         keep = torch.zeros(D, dtype=torch.bool, device=device)
         keep[order[:k]] = True
         ins_imgs.append(imputer.impute(x, keep))
-    ins = model(torch.stack(ins_imgs))                     # (steps+1,)
+    ins = score_target(model, torch.stack(ins_imgs), target=target, score=score)
 
     # DELETION: xoa dan top-k quan trong (keep = phan con lai)
     del_imgs = []
@@ -390,7 +428,7 @@ def insertion_deletion_tabular(model, x, phi, imputer: GaussImputer, steps=None)
         keep = torch.ones(D, dtype=torch.bool, device=device)
         keep[order[:k]] = False
         del_imgs.append(imputer.impute(x, keep))
-    dele = model(torch.stack(del_imgs))                    # (steps+1,)
+    dele = score_target(model, torch.stack(del_imgs), target=target, score=score)
 
     return {"insertion_auc": ins.mean().item(),
             "deletion_auc": dele.mean().item(),
@@ -416,7 +454,7 @@ def run_e0(reg: Regime, model, device, args):
     X_ref, _ = sample_regime(reg, args.n_ref, device, args.seed + 100)
     X_eval, _ = sample_regime(reg, args.n_eval, device, args.seed + 200)
     ref = fit_reference(X_ref, floor=args.floor)
-    grad_fn = make_tabular_gradfn(model, device, chunk=args.chunk)
+    grad_fn = make_tabular_gradfn(model, device, chunk=args.chunk)  # regression: n_out=1
 
     driver_mask = torch.zeros(reg.D, dtype=torch.long, device=device)
     driver_mask[reg.driver_idx] = 1
@@ -473,7 +511,16 @@ def run_e1(reg: Regime, model, device, args):
     ref = fit_reference(X_ref, floor=args.floor)
     ppca_ref, psi = fit_ppca(X_ref, q=args.ppca_q)
     imputer = fit_imputer(X_imp)
-    grad_fn = make_tabular_gradfn(model, device, chunk=args.chunk)
+
+    target = 1  # lop "duong" (y > median). Neu classif, chi giai thich mau lop target.
+    if model.n_out == 2:
+        with torch.no_grad():
+            pred = score_target(model, X_eval, target=target, score="softmax") > 0.5
+        X_eval = X_eval[pred]                              # ins/del chi don dieu tren mau target
+        if X_eval.shape[0] == 0:
+            print("[!] khong co mau lop target trong tap eval"); return {}
+    grad_fn = make_tabular_gradfn(model, device, chunk=args.chunk,
+                                  target=target, score=args.score)
 
     mu = X_ref.mean(dim=0)
     med = X_ref.median(dim=0).values
@@ -521,7 +568,8 @@ def run_e1(reg: Regime, model, device, args):
         for i in range(X_eval.shape[0]):
             x = X_eval[i]
             phi = attr_for(nm, x)
-            r = insertion_deletion_tabular(model, x, phi, imputer, steps=args.insdel_steps)
+            r = insertion_deletion_tabular(model, x, phi, imputer, steps=args.insdel_steps,
+                                           target=target, score=args.score)
             ins.append(r["insertion_auc"]); dels.append(r["deletion_auc"]); gaps.append(r["id_gap"])
         ins_t = torch.tensor(ins); del_t = torch.tensor(dels); gap_t = torch.tensor(gaps)
         # bootstrap SE cua I-D gap
@@ -569,6 +617,8 @@ def parse_args():
     ap.add_argument("--ppca_q", type=int, default=5, help="rank q cho PM-IG-PPCA")
     ap.add_argument("--insdel_steps", type=int, default=None, help="so buoc ins/del (mac dinh D)")
     ap.add_argument("--n_boot", type=int, default=1000, help="so lan bootstrap CI")
+    ap.add_argument("--score", type=str, default="softmax", choices=["logit", "softmax"],
+                    help="E1: score dung CHUNG cho attribution + metric (softmax -> AUC in [0,1])")
     ap.add_argument("--epochs", type=int, default=300, help="epoch fit MLP")
     ap.add_argument("--chunk", type=int, default=4096)
     ap.add_argument("--device", type=str, default="cuda")
@@ -588,19 +638,27 @@ def main():
 
     for rn in regimes:
         reg = make_regime(rn, args.D, device, args.seed)
-        model = train_model(reg, device, args.seed, epochs=args.epochs)
-        # bao cao chat luong fit de biet gradient co y nghia
-        with torch.no_grad():
-            Xte, yte = sample_regime(reg, 2000, device, args.seed + 777)
-            pred = model(Xte)
-            yn = (yte - torch.tensor(model._ymu, device=device)) / torch.tensor(model._ysd, device=device)
-            r2 = 1 - F.mse_loss(pred, yn).item() / yn.var().item()
-        print(f"\n[model fit] regime={rn}  R^2(test)={r2:.4f}")
 
         if args.only in ("all", "e0"):
-            run_e0(reg, model, device, args)
+            # E0 dung model REGRESSION (target lien tuc) de test bias phuong sai cho sach
+            model_reg = train_model(reg, device, args.seed, epochs=args.epochs, task="regression")
+            with torch.no_grad():
+                Xte, yte = sample_regime(reg, 2000, device, args.seed + 777)
+                pred = model_reg(Xte).squeeze(-1)
+                yn = (yte - model_reg._ymu) / model_reg._ysd
+                r2 = 1 - F.mse_loss(pred, yn).item() / yn.var().item()
+            print(f"\n[model fit] regime={rn}  task=regression  R^2(test)={r2:.4f}")
+            run_e0(reg, model_reg, device, args)
+
         if args.only in ("all", "e1"):
-            run_e1(reg, model, device, args)
+            # E1 dung model CLASSIFICATION (nhan y>median) -> softmax AUC in [0,1]
+            model_clf = train_model(reg, device, args.seed, epochs=args.epochs, task="classif")
+            with torch.no_grad():
+                Xte, yte = sample_regime(reg, 2000, device, args.seed + 777)
+                ybin = (yte > model_clf._thresh).long()
+                acc = (model_clf(Xte).argmax(1) == ybin).float().mean().item()
+            print(f"\n[model fit] regime={rn}  task=classif  acc(test)={acc:.4f}")
+            run_e1(reg, model_clf, device, args)
 
 
 if __name__ == "__main__":

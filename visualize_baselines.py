@@ -102,7 +102,7 @@ def measure_panel(ax, insdel_res):
         ax.legend(fontsize=6, loc="center right", framealpha=0.5)
     # so lieu
     txt = f"ins={ins_auc:.3f}\ndel={del_auc:.3f}\nI-D={idg:+.3f}"
-    ax.text(0.03, 0.97, txt, transform=ax.transAxes, fontsize=12,
+    ax.text(0.03, 0.97, txt, transform=ax.transAxes, fontsize=18,
             va="top", ha="left",
             bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.85))
     ax.set_xticks([0, 1]); ax.set_yticks([0, 1])

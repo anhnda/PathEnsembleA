@@ -104,50 +104,28 @@ def make_forward_func(model_type):
     """
     Tra ve nn_forward_func(model, input_embed, attention_mask, position_embed, type_embed).
     input_embed la WORD embedding (chua cong position/type); ham nay tu cong roi chay.
-    Dung duong ...embeddings.LayerNorm de khop dung pipeline cua tung model.
+    Bat chuoc dung nn_forward_func goc (bert/distilbert/roberta helper):
+      embeds = word + position (+ type); LayerNorm + dropout; roi
+      model(inputs_embeds=embeds, attention_mask=mask) — HF tu lo encoder + head + mask.
     """
     def fwd_bert(model, input_embed, attention_mask=None, position_embed=None, type_embed=None):
-        emb = input_embed
-        if position_embed is not None:
-            emb = emb + position_embed
+        emb = input_embed + position_embed
         if type_embed is not None:
             emb = emb + type_embed
-        emb = model.bert.embeddings.LayerNorm(emb)
-        emb = model.bert.embeddings.dropout(emb)
-        ext = model.get_extended_attention_mask(attention_mask, input_embed.shape[:-1])
-        n_layers = model.config.num_hidden_layers
-        enc = model.bert.encoder(emb, attention_mask=ext, head_mask=[None] * n_layers)[0]
-        pooled = model.bert.pooler(enc) if model.bert.pooler is not None else enc[:, 0]
-        return model.classifier(model.dropout(pooled) if hasattr(model, "dropout") else pooled)
+        emb = model.bert.embeddings.dropout(model.bert.embeddings.LayerNorm(emb))
+        return model(inputs_embeds=emb, attention_mask=attention_mask)[0]
 
     def fwd_distilbert(model, input_embed, attention_mask=None, position_embed=None, type_embed=None):
-        emb = input_embed
-        if position_embed is not None:
-            emb = emb + position_embed
-        emb = model.distilbert.embeddings.LayerNorm(emb)
-        emb = model.distilbert.embeddings.dropout(emb)
-        n_layers = model.config.num_hidden_layers
-        enc = model.distilbert.transformer(
-            x=emb, attn_mask=attention_mask, head_mask=[None] * n_layers,
-        )[0]
-        pooled = enc[:, 0]                                 # [CLS]
-        pooled = model.pre_classifier(pooled)
-        pooled = torch.nn.ReLU()(pooled)
-        pooled = model.dropout(pooled)
-        return model.classifier(pooled)
+        emb = input_embed + position_embed
+        emb = model.distilbert.embeddings.dropout(model.distilbert.embeddings.LayerNorm(emb))
+        return model(inputs_embeds=emb, attention_mask=attention_mask)[0]
 
     def fwd_roberta(model, input_embed, attention_mask=None, position_embed=None, type_embed=None):
-        emb = input_embed
-        if position_embed is not None:
-            emb = emb + position_embed
+        emb = input_embed + position_embed
         if type_embed is not None:
             emb = emb + type_embed
-        emb = model.roberta.embeddings.LayerNorm(emb)
-        emb = model.roberta.embeddings.dropout(emb)
-        ext = model.get_extended_attention_mask(attention_mask, input_embed.shape[:-1])
-        n_layers = model.config.num_hidden_layers
-        enc = model.roberta.encoder(emb, attention_mask=ext, head_mask=[None] * n_layers)[0]
-        return model.classifier(enc)                       # RobertaClassificationHead lay <s>
+        emb = model.roberta.embeddings.dropout(model.roberta.embeddings.LayerNorm(emb))
+        return model(inputs_embeds=emb, attention_mask=attention_mask)[0]
 
     return {"bert": fwd_bert, "distilbert": fwd_distilbert, "roberta": fwd_roberta}[model_type]
 
@@ -180,10 +158,8 @@ def get_embeddings(model, model_type, input_ids, attention_mask):
     if model_type == "roberta":
         E = model.roberta.embeddings
         word = E.word_embeddings(input_ids)
-        # RoBERTa position ids: pad_idx + cumsum(mask) (offset padding)
-        pad_idx = E.padding_idx
-        mask = (input_ids != pad_idx).long()
-        pos_ids = (torch.cumsum(mask, dim=1) * mask) + pad_idx
+        # dung buffer position_ids san co cua model (khop helper goc)
+        pos_ids = E.position_ids[:, :seq].to(dev)
         position = E.position_embeddings(pos_ids)
         type_ids = torch.zeros_like(input_ids)
         type_e = E.token_type_embeddings(type_ids)

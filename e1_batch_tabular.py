@@ -36,7 +36,7 @@ import torch.nn.functional as F
 
 from sklearn import datasets
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import MinMaxScaler
 
 # dung lai toan bo may moc tu synthetic_e0.py
 from synthetic_e0 import (
@@ -92,7 +92,7 @@ def load_tabular(name, test_size, seed, device):
     X, y = d.data, d.target
     Xtr, Xte, ytr, yte = train_test_split(
         X, y, test_size=test_size, random_state=seed, stratify=y)
-    sc = StandardScaler().fit(Xtr)                         # chuan hoa theo TRAIN
+    sc = MinMaxScaler().fit(Xtr)                           # normalize [0,1] theo TRAIN
     Xtr = torch.tensor(sc.transform(Xtr), dtype=torch.float32, device=device)
     Xte = torch.tensor(sc.transform(Xte), dtype=torch.float32, device=device)
     ytr = torch.tensor(ytr, dtype=torch.long, device=device)

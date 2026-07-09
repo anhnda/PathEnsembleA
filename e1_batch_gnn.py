@@ -183,6 +183,32 @@ def make_gnnex(model, epochs):
     )
 
 
+# ---------------------------------------------------------------------------
+# GNNExplainer THU CONG voi REFERENCE CAM DUOC.
+#   PyG mac dinh: x_masked = mask (*) x = mask (*) x + (1-mask) (*) 0  -> reference = 0.
+#   Ta thay 0 bang `baseline` (vd b_tau(x) shrinkage):
+#       x_masked = mask (*) x + (1-mask) (*) baseline
+#   Hoc node mask (per-node scalar) bang GD, loss = -logit_target + L1 + entropy
+#   (tinh than GNNExplainer). Tra ve node mask (N,).
+#   => CUNG thuat toan, chi khac REFERENCE noi bo:
+#      "GNNExplainer(zero) vs GNNExplainer(shrinkage)".
+# ---------------------------------------------------------------------------
+def gnnex_manual(model, x, edge_index, target, baseline, epochs=100,
+                 lr=0.01, l1=0.005, ent=1.0):
+    N = x.shape[0]
+    m = torch.zeros(N, device=x.device, requires_grad=True)   # logit mask
+    opt = torch.optim.Adam([m], lr=lr)
+    for _ in range(epochs):
+        mask = m.sigmoid()[:, None]                           # (N,1)
+        x_masked = mask * x + (1.0 - mask) * baseline         # <- reference cam vao day
+        logit = model(x_masked, edge_index)[0, target]
+        s = m.sigmoid()
+        loss = -logit + l1 * s.mean() + ent * (-(s * (s + 1e-9).log()
+                                                  + (1 - s) * (1 - s + 1e-9).log())).mean()
+        opt.zero_grad(); loss.backward(); opt.step()
+    return m.sigmoid().detach()                               # (N,)
+
+
 def mask_from_explanation(expl, N, device):
     if getattr(expl, "node_mask", None) is not None:
         nm = expl.node_mask
@@ -275,21 +301,21 @@ def main():
         except Exception as e:
             print(f"[!] PGExplainer bo qua: {e}"); pg = None
 
-    gnnex = None
-    if not args.skip_gnnex:
-        try: gnnex = make_gnnex(model, args.gnnex_epochs)
-        except Exception as e: print(f"[!] GNNExplainer bo qua: {e}")
-
-    print("[!] SubgraphX: khong co trong PyG core. BO QUA — khong gia lap.\n")
+    print("[!] SubgraphX: khong co trong PyG core. BO QUA — khong gia lap.")
+    print("[i] GNNExplainer chay ban THU CONG (reference cam duoc): zero vs shrinkage.\n")
 
     te_eval = te[:args.limit]
     gen = torch.Generator(device="cpu"); gen.manual_seed(args.seed + 7)
+
+    # tau dung cho reference shrinkage cam vao GNNExplainer (lay tau giua cua sweep)
+    tau_for_gnnex = args.tau_sweep[len(args.tau_sweep) // 2]
 
     # DANH SACH NGUON MASK
     mask_sources = ["IG-zero"]
     mask_sources += [f"Shrink-node@{t:g}" for t in args.tau_sweep]
     mask_sources += [f"Shrink-graph@{s:g}" for s in args.sigma_sweep]
-    if gnnex is not None: mask_sources.append("GNNExplainer(default)")
+    # --- THI NGHIEM CHINH: cung GNNExplainer, khac REFERENCE noi bo ---
+    mask_sources += ["GNNExplainer(zero)", f"GNNExplainer(shrink@{tau_for_gnnex:g})"]
     if pg is not None:    mask_sources.append("PGExplainer(default)")
 
     def get_mask(nm, x, edge_index, target, N):
@@ -303,10 +329,15 @@ def main():
         # --- IG-zero: reference suy bien -> mask ---
         if nm == "IG-zero":
             return mask_ig_zero(model, x, edge_index, target, T=args.N_ig)
-        # --- nguon MAC DINH cua linh vuc ---
-        if nm == "GNNExplainer(default)":
-            e = gnnex(x, edge_index, target=torch.tensor([target], device=x.device))
-            return mask_from_explanation(e, N, x.device)
+        # --- THI NGHIEM CHINH: GNNExplainer cung thuat toan, khac REFERENCE ---
+        if nm == "GNNExplainer(zero)":
+            base = torch.zeros_like(x)                        # reference mac dinh = 0
+            return gnnex_manual(model, x, edge_index, target, base, epochs=args.gnnex_epochs)
+        if nm.startswith("GNNExplainer(shrink@"):
+            tau = float(nm.split("@")[1].rstrip(")"))
+            base = shrink_node_baseline(x, node_ref, tau)     # reference = b_tau(x)
+            return gnnex_manual(model, x, edge_index, target, base, epochs=args.gnnex_epochs)
+        # --- PGExplainer mac dinh ---
         if nm == "PGExplainer(default)":
             e = pg(x, edge_index, target=torch.tensor([target], device=x.device))
             return mask_from_explanation(e, N, x.device)

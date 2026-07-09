@@ -398,55 +398,68 @@ def fit_imputer(X: torch.Tensor) -> GaussImputer:
 @torch.no_grad()
 def insertion_deletion_tabular(model, x, phi, imputer: GaussImputer,
                                steps=None, target=1, score="softmax",
-                               mode="zero", baseline_vec=None):
+                               mode="marginal", baseline_vec=None,
+                               X_pool=None, gen=None):
     """
     Insertion/deletion tren 1 mau (tabular).
     - order feature theo |phi| giam dan.
-    - insertion: bat dau tat ca feature = baseline, lan luot LO ra feature quan trong
+    - insertion: bat dau tat ca feature = "da xoa", lan luot LO ra feature quan trong
       nhat (dat lai gia tri that), do score target.
-    - deletion : bat dau tu x day du, lan luot XOA feature quan trong nhat (ve baseline).
-    mode:
-      "zero"       : feature bi xoa/an -> baseline_vec (mac dinh 0 = mean sau StandardScaler).
-                     Hard remove marginal — nhay, don gian, KHONG bi conditional mean tai tao
-                     feature tuong quan (dung cho tabular). imputer bi bo qua.
-      "conditional": feature bi xoa/an -> E[x_miss|x_keep] (Gaussian conditional mean).
-                     Ton trong tuong quan nhung CO THE LI khi feature tuong quan manh.
-    AUC = trung binh score tren cac buoc. score='softmax' -> [0,1].
+    - deletion : bat dau tu x day du, lan luot XOA feature quan trong nhat.
+
+    mode (cach XOA mot feature):
+      "marginal"   : (MAC DINH — dung) thay feature bi xoa bang gia tri BOC NGAU NHIEN
+                     tu chinh cot do trong X_pool. Pha thong tin cua feature nhung GIU
+                     input trong vung hop le (in-distribution), KHONG lua ve mot diem
+                     cuc doan (goc hop) khien model tra logit OOD. Can X_pool.
+      "conditional": E[x_miss|x_keep] (Gaussian conditional mean). Ton trong tuong quan
+                     nhung CO THE LI khi feature tuong quan manh (tai tao lai feature bi xoa).
+      "zero"       : thay bang baseline_vec (mac dinh 0). CANH BAO: tren du lieu duong
+                     (vd breast_cancer sau MinMax) "xoa het ve 0" = goc hop = diem CUC DOAN
+                     model phan chac chan ve 1 lop -> deletion DINH TRAN ~1.0, VO NGHIA.
+                     Chi giu de doi chieu, KHONG dung lam metric chinh.
+
+    AUC = trung binh score tren cac buoc, BO diem k=0 (chua can thiep) de khong bi keo
+    gia tao. score='softmax' -> [0,1]. Voi 'marginal', boc ngau nhien nen dung `gen`
+    de tai lap; nen trung binh nhieu lan neu can (o day 1 lan/mau, du vi n_eval lon).
     """
     D = x.shape[0]
     steps = steps or D
     order = torch.argsort(phi.abs(), descending=True)      # (D,)
     device = x.device
     if baseline_vec is None:
-        baseline_vec = torch.zeros(D, device=device)       # 0 = mean sau StandardScaler
+        baseline_vec = torch.zeros(D, device=device)
+    if mode == "marginal":
+        assert X_pool is not None, "mode='marginal' can X_pool (tap de boc gia tri cot)"
 
     def fill(keep_mask):
         if mode == "conditional":
             return imputer.impute(x, keep_mask)
-        # zero/marginal: giu x o keep, con lai = baseline_vec
+        if mode == "marginal":
+            out = x.clone()
+            miss = torch.where(~keep_mask)[0]
+            if miss.numel():
+                rows = torch.randint(0, X_pool.shape[0], (miss.numel(),), generator=gen)
+                out[miss] = X_pool[rows.to(device), miss]
+            return out
+        # zero
         return torch.where(keep_mask, x, baseline_vec)
 
     ks = torch.linspace(0, D, steps + 1, device=device).round().long()
 
-    # INSERTION: keep = top-k feature quan trong; con lai = baseline
-    ins_imgs = []
+    ins_imgs, del_imgs = [], []
     for k in ks:
-        keep = torch.zeros(D, dtype=torch.bool, device=device)
-        keep[order[:k]] = True
-        ins_imgs.append(fill(keep))
+        ki = int(k)
+        keep_ins = torch.zeros(D, dtype=torch.bool, device=device); keep_ins[order[:ki]] = True
+        keep_del = torch.ones(D, dtype=torch.bool, device=device);  keep_del[order[:ki]] = False
+        ins_imgs.append(fill(keep_ins)); del_imgs.append(fill(keep_del))
     ins = score_target(model, torch.stack(ins_imgs), target=target, score=score)
-
-    # DELETION: xoa dan top-k quan trong (keep = phan con lai)
-    del_imgs = []
-    for k in ks:
-        keep = torch.ones(D, dtype=torch.bool, device=device)
-        keep[order[:k]] = False
-        del_imgs.append(fill(keep))
     dele = score_target(model, torch.stack(del_imgs), target=target, score=score)
 
-    return {"insertion_auc": ins.mean().item(),
-            "deletion_auc": dele.mean().item(),
-            "id_gap": (ins.mean() - dele.mean()).item()}
+    # BO diem k=0 (index 0) o ca hai dau
+    return {"insertion_auc": ins[1:].mean().item(),
+            "deletion_auc": dele[1:].mean().item(),
+            "id_gap": (ins[1:].mean() - dele[1:].mean()).item()}
 
 
 @torch.no_grad()
@@ -622,6 +635,7 @@ def run_e1(reg: Regime, model, device, args):
     print(f"{'method':<20}{'insertion↑':>12}{'deletion↓':>12}{'I-D↑':>10}"
           f"{'  (mean ± boot-SE)'}")
     print("-" * 66)
+    idg = torch.Generator(device="cpu"); idg.manual_seed(args.seed + 7)   # boc marginal
     table = {}
     for nm in methods:
         gaps, ins, dels = [], [], []
@@ -629,7 +643,8 @@ def run_e1(reg: Regime, model, device, args):
             x = X_eval[i]
             phi = attr_for(nm, x)
             r = insertion_deletion_tabular(model, x, phi, imputer, steps=args.insdel_steps,
-                                           target=target, score=args.score)
+                                           target=target, score=args.score,
+                                           mode="marginal", X_pool=X_ref, gen=idg)
             ins.append(r["insertion_auc"]); dels.append(r["deletion_auc"]); gaps.append(r["id_gap"])
         ins_t = torch.tensor(ins); del_t = torch.tensor(dels); gap_t = torch.tensor(gaps)
         # bootstrap SE cua I-D gap

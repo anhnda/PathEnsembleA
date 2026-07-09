@@ -69,8 +69,11 @@ def parse_args():
     ap.add_argument("--metric", type=str, default="insdel", choices=["insdel", "soft"],
                     help="insdel = insertion/deletion remove-to-zero (mac dinh, hop tabular); "
                          "soft = Soft-Faith (KHONG hop tabular 1-chieu du thua, chi de tham khao)")
-    ap.add_argument("--insdel_mode", type=str, default="zero", choices=["zero", "conditional"],
-                    help="zero = remove ve 0 (marginal, nhay); conditional = Gaussian cond mean (co the li)")
+    ap.add_argument("--insdel_mode", type=str, default="marginal",
+                    choices=["marginal", "conditional", "zero"],
+                    help="marginal (MAC DINH) = boc gia tri that tu cot, pha thong tin nhung "
+                         "GIU in-distribution (dung cho tabular duong); conditional = Gaussian "
+                         "cond mean (co the li); zero = remove ve 0 (CANH BAO: OOD, deletion dinh tran ~1)")
     ap.add_argument("--rand_seeds", type=int, default=5,
                     help="so seed cho baseline ngau nhien (IG-random/EG) — bao cao mean±std de kh khoi may rui")
     ap.add_argument("--n_soft", type=int, default=20, help="so mau Bernoulli cho soft metric")
@@ -220,6 +223,7 @@ def main():
         print(f"{'method':<20}{'insertion↑':>12}{'deletion↓':>12}{'I-D↑':>10}"
               f"{'  (mean ± boot-SE [± seed-std])'}")
         print("-" * 74)
+        idg = torch.Generator(device="cpu"); idg.manual_seed(args.seed + 7)   # boc marginal
         for nm in methods:
             seeds = list(range(args.rand_seeds)) if is_stochastic(nm) else [None]
             # gap per-sample TRUNG BINH qua seed (de paired test), + seed-level I-D de bao variance
@@ -233,7 +237,8 @@ def main():
                     x = X_eval[i]
                     phi = attr_for(nm, x, rng_seed=rs)
                     r = insertion_deletion_tabular(model, x, phi, imputer, steps=args.insdel_steps,
-                                                   target=target, score=args.score, mode=args.insdel_mode)
+                                                   target=target, score=args.score, mode=args.insdel_mode,
+                                                   X_pool=Xtr, gen=idg)
                     ins.append(r["insertion_auc"]); dels.append(r["deletion_auc"]); gaps.append(r["id_gap"])
                 gaps_t = torch.tensor(gaps)
                 per_sample_gap = gaps_t if per_sample_gap is None else per_sample_gap + gaps_t

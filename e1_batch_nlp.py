@@ -442,6 +442,9 @@ def main():
                 d["pf"].append(pf); d["pb"].append(pb)
                 d["ratio"].append(pb / pf if pf > 1e-9 else float("nan")); d["shift"].append(shift)
 
+            # sanitize: rival co the tao attr NaN/Inf/scale lon -> soft metric vo Bernoulli p ngoai [0,1]
+            attr_full = torch.nan_to_num(attr_full, nan=0.0, posinf=0.0, neginf=0.0)
+
             # attr_token cho soft metric: soft_faith nhan attr theo TOKEN (seq,)
             attr_token = attr_full.sum(dim=-1).squeeze(0)  # (seq,)
             attr_for_metric = attr_token.clone()

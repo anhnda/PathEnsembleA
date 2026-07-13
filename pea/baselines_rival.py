@@ -88,7 +88,7 @@ def ig2_attribution(model, x, x_ref, target, rep_fn,
         gf, = torch.autograd.grad(logit, gj, retain_graph=True)
         # counterfactual gradient: d ||rep(gamma)-rep(x^r)|| / dx  (path direction proxy)
         rep = rep_fn(gj[None])
-        dcf = (rep - x_ref_rep).pow(2).sum().sqrt()
+        dcf = (rep - x_ref_rep).pow(2).sum().add(1e-12).sqrt()
         gc, = torch.autograd.grad(dcf, gj)
         Wn = gc.norm(p=2) + 1e-12
         phi += (gf.detach() * gc.detach()) * (eta / Wn)
@@ -225,7 +225,7 @@ def ig2_tabular(model, x, x_ref, target, rep_fn, steps=40, step_size=None,
             gj = path[j].clone().requires_grad_(True)
             logit = _tab_score(model, gj, target, score)
             gf, = torch.autograd.grad(logit, gj, retain_graph=True)
-            dcf = (rep_fn(gj) - x_ref_rep).pow(2).sum().sqrt()
+            dcf = (rep_fn(gj) - x_ref_rep).pow(2).sum().add(1e-12).sqrt()
             gc, = torch.autograd.grad(dcf, gj)
             Wn = gc.norm(p=2) + 1e-12
             phi += (gf.detach() * gc.detach()) * (eta / Wn)
@@ -336,7 +336,7 @@ def ig2_nlp(fwd, model, word_embed, ref_embed, pred_class, attn, pos, typ,
             logit = _nlp_logits(fwd, model, gj, attn, pos, typ)[0, pred_class]
             gf, = torch.autograd.grad(logit, gj, retain_graph=True)
             lg = _nlp_logits(fwd, model, gj, attn, pos, typ)
-            dcf = (lg - ref_logit).pow(2).sum().sqrt()
+            dcf = (lg - ref_logit).pow(2).sum().add(1e-12).sqrt()
             gc, = torch.autograd.grad(dcf, gj)
             Wn = gc.norm(p=2) + 1e-12
             attr_full += (gf.detach() * gc.detach()) * (eta / Wn)

@@ -306,14 +306,11 @@ def selection_rules(curve: dict, eps: float = 0.05):
                   tabular: ti gia VAN TANG tai @100  -> di tiep (grid cut dau)
                 Neu rule roi vao DIEM CUOI grid => grid cut dau, phai noi rong.
 
-    tau_knee  : Kneedle PER-INPUT tren [i, f_i].
-                truc x = INDEX cua sweep; truc y = f(b_tau(x)) cua CHINH input do.
-                Moi input mot knee (vi b_tau(x) phu thuoc x). In phan bo, khong
-                in mot con so chung.
+    tau_knee  : DIEM DOC DAU TIEN tren [i, f(b)], PER-INPUT.
+                j* = argmax_j [ f(b_j) - f(b_{j+1}) ]  -> tau = taus[j*+1]
+                = cho baseline BAT DAU thuc su xoa thong tin.
+                Per-input vi b_tau(x) phu thuoc x.
                 LUU Y: index KHONG phai dai luong vat ly => phu thuoc GRID.
-                Them/bot diem sweep o vung bao hoa se KEO GIAN index va DICH knee.
-                Bang chung: tabular, grid 5 diem cho knee @1; them 200/300/400/1000
-                (deu la MEAN baseline, f(b) da dung yen) thi knee nhay sang @100.
 
     (Da bo tau_amp: no can K => modality-specific => bang cross-modality vo nghia.)
     """
@@ -348,31 +345,24 @@ def selection_rules(curve: dict, eps: float = 0.05):
     out["tau_rate"] = taus[idx_star]
     at_edge = float((idx_star[valid] == T - 1).float().mean().item()) if int(valid.sum()) else 0.0
 
-    # --- tau_knee: Kneedle PER-INPUT tren [i, f_i] ---
+    # --- tau_knee: DIEM DOC DAU TIEN tren [i, f(b)] , PER-INPUT ---
     #
-    # HAI LOI DA MAC:
+    # LICH SU:
+    #  (1) Trung binh cac duong cong roi tim knee -> SAI. b_tau(x) phu thuoc x =>
+    #      moi input mot duong cong rieng. Sua: per-input.
+    #  (2) Kneedle chuan (max khoang cach toi duong cheo) -> SAP: tra ve DAY GRID
+    #      o MOI input (tau=0.00047, IQR=0).
+    #      Ly do: f(b) vs index co dang SIGMOID NGUOC (phang -> doc -> phang),
+    #      tuc LOI o dau roi LOM o cuoi — HAI diem uon. Kneedle gia dinh duong
+    #      giam LOM (doc-roi-phang) va chi bat duoc MOT. Sai dang => rot ve dau.
     #
-    # (1) TRUNG BINH ROI TIM KNEE, thay vi TIM KNEE ROI XEM PHAN BO.
-    #     b_tau(x) PHU THUOC x => moi input co duong cong f(b_tau(x)) RIENG, knee RIENG,
-    #     tau toi uu RIENG. Bang chung: ORACLE per-input IQR [0.076, 0.961] — trai hon
-    #     mot bac. Va win% o vision chi 33-38% => mot sigma toan cuc chi dung cho 1/3 anh.
-    #     Trung binh cac duong cong lam MO knee: input A gay o tau=0.1, input B gay o
-    #     tau=2 => duong trung binh thoai, khong co gay ro.
-    #
-    # (2) SAI TRUC. Da code Kneedle tren (log tau, Δf) + cummax. Phai la [i, f_i]:
-    #       truc x = INDEX i cua sweep (0..T-1), chuan hoa [0,1]
-    #       truc y = f(b_tau_i(x)) cua CHINH input do, chuan hoa [0,1] theo min/max
-    #                cua CHINH no (khong phai min/max toan cuc)
-    #     Duong cong GIAM => knee = max (1 - x̂) - ŷ.
-    #     Do la ly do tau_knee = day grid o MOI input (0.00047, IQR bang 0): sai ham,
-    #     khong phai sai du lieu.
+    # SUA: lay DIEM DOC DAU TIEN — index j dau tien dat |f'| cuc dai.
+    #      f' = sai phan f(b) theo index (buoc = 1, nen chi la hieu).
+    #      Do la cho baseline BAT DAU thuc su xoa thong tin.
     f_b = curve["rho"] * curve["f_x"][:, None]                    # (M,T) f(b) PER-INPUT
-    xh = torch.arange(T, device=dev, dtype=torch.float) / max(T - 1, 1)   # (T,) index chuan hoa
-    lo = f_b.min(dim=1, keepdim=True).values
-    hi = f_b.max(dim=1, keepdim=True).values
-    yh = (f_b - lo) / (hi - lo).clamp_min(1e-12)                  # (M,T) giam 1 -> 0
-    dev_knee = (1.0 - xh[None]) - yh                              # (M,T)
-    out["tau_knee"] = taus[dev_knee.argmax(dim=1)]
+    df_di = f_b[:, :-1] - f_b[:, 1:]                              # (M,T-1) do DOC (duong)
+    j_star = df_di.argmax(dim=1)                                  # khoang doc nhat
+    out["tau_knee"] = taus[(j_star + 1).clamp_max(T - 1)]         # DIEM CUOI khoang do
 
     out["_at_edge"] = at_edge
     return out, valid

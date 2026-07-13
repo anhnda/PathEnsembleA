@@ -392,11 +392,20 @@ def main():
         oracle = None
         if args.diag_oracle:
             print(f"\n[i] dang chay ORACLE: ins/del tai {len(taus_d)} tau x {X_eval.shape[0]} mau (DAT)...")
-            og = torch.Generator(device="cpu"); og.manual_seed(args.seed + 7)
+            # BUG DA SUA: truoc day ORACLE dung generator `og` chay lien tuc qua
+            # 30 tau x 21 mau = 630 lan boc, con bang E1 dung `idg` chi 21 lan/method.
+            # State cua hai generator LECH HOAN TOAN => ORACLE chon tau toi uu cho
+            # MOT lan boc mau marginal, roi bi cham diem tren lan boc KHAC => overfit
+            # vao noise => Adaptive-oracle THUA ca Adaptive-rate (vo ly, vi oracle
+            # phai la TRAN TREN). Bang chung: SE cua oracle lon nhat (0.0401).
+            #
+            # SUA: reset generator theo INPUT i (seed = base + i). Moi input luon thay
+            # DUNG CUNG mau marginal, bat ke tau nao / method nao. Bang E1 lam y het.
             id_per_tau = torch.zeros(X_eval.shape[0], len(taus_d), device=device)
             for t_i, t in enumerate(taus_d):
                 for i in range(X_eval.shape[0]):
                     x = X_eval[i]
+                    og = torch.Generator(device="cpu"); og.manual_seed(args.seed + 7 + i)
                     b = shrinkage_baseline(x, ref, tau=t)
                     phi = ig_tabular(x, b, grad_fn, T=N)
                     r = insertion_deletion_tabular(model, x, phi, imputer, steps=args.insdel_steps,
@@ -521,7 +530,9 @@ def main():
               f"{'f(x)':>8}{'f(b)':>8}{'Δf':>9}{'|b-x|₂':>10}{'P2':>6}"
               f"{'  (mean±SE[±seed-std])'}")
         print("-" * 105)
-        idg = torch.Generator(device="cpu"); idg.manual_seed(args.seed + 7)   # boc marginal
+        # generator reset theo INPUT i (seed = args.seed + 7 + i) — KHOP voi ORACLE loop.
+        # Moi input luon thay DUNG CUNG mau marginal o moi method => so sanh cong bang,
+        # va ORACLE thuc su la TRAN TREN (khong con overfit vao noise cua mot lan boc).
         for nm in methods:
             seeds = list(range(args.rand_seeds)) if is_stochastic(nm) else [None]
             # gap per-sample TRUNG BINH qua seed (de paired test), + seed-level I-D de bao variance
@@ -533,6 +544,7 @@ def main():
                 ins, dels, gaps = [], [], []
                 for i in range(X_eval.shape[0]):
                     x = X_eval[i]
+                    idg = torch.Generator(device="cpu"); idg.manual_seed(args.seed + 7 + i)
                     phi = attr_for(nm, x, rng_seed=rs, i=i)
                     r = insertion_deletion_tabular(model, x, phi, imputer, steps=args.insdel_steps,
                                                    target=target, score=args.score, mode=args.insdel_mode,
@@ -558,6 +570,20 @@ def main():
     gap_label = "Soft-gap" if args.metric == "soft" else "I-D"
     print("-" * 68)
     best = max(table, key=lambda k: table[k]["id_gap"])
+
+    # ---- SANITY: Adaptive-oracle PHAI la tran tren cua moi Shrinkage-* ----
+    if "Shrinkage-Adaptive-oracle" in table:
+        orc = table["Shrinkage-Adaptive-oracle"]["id_gap"]
+        above = [(m, table[m]["id_gap"]) for m in table
+                 if m.startswith("Shrinkage-") and table[m]["id_gap"] > orc]
+        if above:
+            print(f"[!!] Adaptive-oracle ({orc:.4f}) BI VUOT boi:")
+            for m, v in sorted(above, key=lambda r: -r[1]):
+                print(f"[!!]   {m} = {v:.4f}  (+{v-orc:.4f})")
+            print("[!!]  ORACLE phai la TRAN TREN. Bi vuot => ORACLE tinh SAI, hoac n qua nho")
+            print("[!!]  de chon tau per-input on dinh (overfit vao noise cua ins/del).")
+        else:
+            print(f"[i] Adaptive-oracle = {orc:.4f} la TRAN TREN cua moi Shrinkage-*. OK.")
     print(f"[i] best {gap_label}: {best} = {table[best]['id_gap']:.4f} ± {table[best]['id_se']:.4f}"
           f"   <-- best")
     if bl_str.get(best) is not None:

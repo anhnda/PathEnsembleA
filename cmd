@@ -1,0 +1,1 @@
+python e1_batch_image.py benchmark_50 --N 500 --sigma_sweep 2 4 8 16 --rivals --ig2_steps 30 --me_steps 100

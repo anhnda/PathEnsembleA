@@ -321,35 +321,31 @@ def _print_summary_table(metric_names, acc, id_per_image, n_img, title, bl_stren
     id_means = {m: mean_se(acc[m]["id"])[0] for m in metric_names}
     best_m = max(id_means, key=id_means.get)
 
-    # ---- TI GIA BIEN d(Δf)/d|b-x|, tinh giua cac sigma LIEN TIEP tren truc sweep ----
-    # Day la dai luong DUY NHAT can de chon sigma. No noi: di them 1 don vi quang
-    # duong thi mua duoc bao nhieu tin hieu. Chi tinh duoc giua cac hang CUNG TRUC.
-    rate, sig_star, by_eps, rmax_r = {}, None, {}, None
-    if bl_strength and sigma_sweep:
-        shr = [f"Shrinkage-IG@{sg:g}" for sg in sorted(sigma_sweep)]
-        shr = [m for m in shr if m in bl_strength and bl_strength[m].get("df")]
-        pt = {m: (sum(bl_strength[m]["df"]) / len(bl_strength[m]["df"]),
-                  sum(bl_strength[m]["shift"]) / len(bl_strength[m]["shift"])) for m in shr}
-        r_int = []                                    # ti gia cua KHOANG [j, j+1]
-        for j in range(len(shr) - 1):
-            (df_a, s_a), (df_b, s_b) = pt[shr[j]], pt[shr[j + 1]]
-            ds = s_b - s_a
-            r_int.append((df_b - df_a) / ds if abs(ds) > 1e-12 else float("nan"))
-            rate[shr[j]] = r_int[-1]                  # gan cho DIEM DAU khoang
-        # diem cuoi grid: KHONG co khoang sau no => KHONG co ti gia. De trong.
-        # sigma_rate = DIEM CUOI cua khoang tot cuoi cung (ti gia >= eps * max)
-        good = [r for r in r_int if r == r and r > 0]
-        if good:
-            rmax_r = max(good)
-            for e in (0.5, 0.2, 0.1, 0.05, 0.01):
-                js = [j for j, r in enumerate(r_int) if r == r and r >= e * rmax_r]
-                by_eps[e] = shr[max(js) + 1] if js else shr[0]
-            sig_star = by_eps.get(eps)
+    # ---- Δf / |b-x| : DO THAY DOI DAU RA / DO THAY DOI DAU VAO ----
+    # Mot TI SO, KHONG phai dao ham, KHONG phai sai phan grid.
+    #
+    # LICH SU: da thu d(Δf)/d|b-x| (sai phan giua hai sigma lien tiep) va HONG 3 ly do:
+    #   1. Phu thuoc GRID: doi grid sigma thi doi ket qua. Khong bat bien.
+    #   2. O vision, Δ|b-x| gan HANG (41.5, 44.4, 47.0) => chia cho no khong doi thu tu
+    #      => ti gia chi la Δ(Δf) tra hinh, khong them thong tin.
+    #   3. O NLP, Δf KHONG don dieu (dat cuc dai roi giam) => dao ham DOI DAU (am)
+    #      => "tut xuong duoi nguong" vo nghia, no khong tut ma LAT.
+    #
+    # Δf/|b-x| khong dinh ca ba: khong sai phan, khong am, tinh duoc cho MOI hang
+    # (ke ca black/blur/EG/IG2 — chung khong nam tren truc sigma nhung van co Δf va |b-x|).
+    ratio_dx = {}
+    if bl_strength:
+        for m, d in bl_strength.items():
+            if d.get("df") and d.get("shift"):
+                df_ = sum(d["df"]) / len(d["df"])
+                sh_ = sum(d["shift"]) / len(d["shift"])
+                ratio_dx[m] = df_ / sh_ if sh_ > 1e-12 else float("nan")
+    best_ratio = max(ratio_dx, key=ratio_dx.get) if ratio_dx else None
 
     print(f"\n--- {title} (mean±SE tren {n_img} anh) ---")
     print(f"{'method':<20}{'insertion↑':>16}{'deletion↓':>16}{'I-D↑':>16}{'win%':>7}"
-          f"{'f(x)':>8}{'f(b)':>8}{'Δf':>9}{'|b-x|₂':>10}{'d(Δf)/d|b-x|':>15}")
-    print("-" * 137)
+          f"{'f(x)':>8}{'f(b)':>8}{'Δf':>9}{'|b-x|₂':>10}{'Δf/|b-x|':>12}")
+    print("-" * 134)
     for m in metric_names:
         im, ise = mean_se(acc[m]["ins"])
         dm, dse = mean_se(acc[m]["del"])
@@ -364,30 +360,31 @@ def _print_summary_table(metric_names, acc, id_per_image, n_img, title, bl_stren
             if d["pb"]:   fxt = f"{sum(d['pb'])/len(d['pb']):>6.4f}"
             if d.get("df"): dftxt = f"{sum(d['df'])/len(d['df']):>8.4f}"
             if d["shift"]:stxt = f"{sum(d['shift'])/len(d['shift']):>9.4f}"
-        r = rate.get(m)
-        rtxt = f"{r:>15.4g}" if (r is not None and r == r) else f"{'-':>15}"
+        r = ratio_dx.get(m)
+        rtxt = f"{r:>12.5g}" if (r is not None and r == r) else f"{'-':>12}"
         mark = ""
         if m == best_m:
             mark += "  <-- best I-D"
-        if m == sig_star:
-            mark += "  <== sigma_rate"
+        if m == best_ratio:
+            mark += "  <== max Δf/|b-x|"
         print(f"{m:<20}{im:>8.4f}±{ise:<6.4f}{dm:>8.4f}±{dse:<6.4f}{idm:>8.4f}±{idse:<6.4f}"
               f"{winp:>6.1f}%{fx:>8}{fxt:>8}{dftxt:>9}{stxt:>10}{rtxt}{mark}")
-    print("-" * 137)
+    print("-" * 134)
     print(f"[i] dan dau I-D: {best_m} = {id_means[best_m]:.4f}")
-    print("[i] Δf = f(x)-f(b) = ngan sach Completeness. |b-x|₂ = quang duong (L2).")
-    print("[i] d(Δf)/d|b-x| = ti gia bien, gan cho DIEM DAU cua khoang [sigma_j, sigma_j+1].")
-    print("[i]   Hang cuoi grid va hang co dinh (black/blur/EG/IG2) khong nam tren truc -> '-'.")
-    if by_eps:
-        print(f"\n[i] sigma_rate theo eps (KHONG cham I-D, chi forward pass). ti gia max = {rmax_r:.5g}")
-        print(f"{'eps':>8}{'nguong':>14}{'sigma_rate':>22}{'   == best?':>12}")
-        print("-" * 58)
-        for e, m in by_eps.items():
-            ok = "KHOP" if m == best_m else "LECH"
-            print(f"{e:>8g}{e*rmax_r:>14.5g}{m:>22}{ok:>12}")
-        print("-" * 58)
-        print("[i] IN CA DAI eps. KHONG tu chon mot eps roi bao la rule — chon eps sau khi")
-        print("[i]   nhin dap an chinh la cai ma draft dang chi trich BEE.")
+    print("[i] Δf = f(x)-f(b) = do thay doi DAU RA.  |b-x|₂ = do thay doi DAU VAO (L2).")
+    print("[i] Δf/|b-x| = DO THAY DOI DAU RA / DO THAY DOI DAU VAO. Mot TI SO, khong phai dao ham.")
+    print("[i]   Tinh duoc cho MOI hang (ke ca black/blur/EG/IG2). Khong can K, khong can mu,")
+    print("[i]   khong can D, khong phu thuoc grid, khong bao gio am.")
+    if best_ratio:
+        agree = "KHOP" if best_ratio == best_m else "LECH"
+        print(f"[i] max Δf/|b-x| = {best_ratio} ({ratio_dx[best_ratio]:.5g})   [{agree} voi best I-D]")
+        # xep hang doi chieu
+        rk_r = sorted(ratio_dx, key=lambda m: -ratio_dx[m])
+        rk_i = sorted([m for m in metric_names if m in ratio_dx], key=lambda m: -id_means[m])
+        print(f"[i] xep hang Δf/|b-x| : {' > '.join(rk_r[:5])}")
+        print(f"[i] xep hang I-D      : {' > '.join(rk_i[:5])}")
+        print("[i]   Chi dung FORWARD PASS. Neu hai xep hang KHOP => chon duoc sigma ma KHONG")
+        print("[i]   cham insertion/deletion.")
     return best_m
 
 
@@ -486,60 +483,17 @@ def main():
                                         sigma_sweep=args.sigma_sweep,
                                         title=f"KET QUA CUOI CUNG tren {n_img} anh")
 
-    # ---- DIAGNOSTIC: baseline strength, PER-IMAGE (khong bop phang f(x)) ----
+    # ---- f(x) PER-IMAGE (bang chinh in mean; day in phan tan) ----
     if bl_strength:
         import statistics as _st
-        print("\n[DIAG] baseline strength — f(x) la PER-IMAGE, khong phai mot so duy nhat")
-        # f(x) chung cho moi method (cung 50 anh) -> in phan tan cua no
-        any_d = next(iter(bl_strength.values()))
-        pfs = any_d["pf"]
-        print(f"[i] f(x): mean {sum(pfs)/len(pfs):.4f}  sd {_st.pstdev(pfs):.4f}  "
+        pfs = next(iter(bl_strength.values()))["pf"]
+        print(f"\n[i] f(x) PER-IMAGE: mean {sum(pfs)/len(pfs):.4f}  sd {_st.pstdev(pfs):.4f}  "
               f"[min {min(pfs):.4f}, max {max(pfs):.4f}]")
-        print("[i] f(x) BIEN THIEN manh giua cac anh. Ngan sach Completeness = f(x)*(1-rho)")
-        print("[i] ti le voi f(x), con meo mo IG ~ O(L*||b-x||_2^2) thi KHONG. => sigma toi uu")
-        print("[i] phu thuoc f(x) => mot sigma toan cuc khong the dung cho ca 50 anh (win% 38%).")
-        print()
-        # BON cot chung + TI GIA BIEN (chi cho hang Shrinkage — cung truc sigma)
-        print(f"{'method':<20}{'f(x)':>9}{'f(b)':>9}{'Δf':>10}{'|b-x|₂':>11}"
-              f"{'d(Δf)/d|b-x|':>16}")
-        print("-" * 76)
-        rows = {}
-        for m in metric_names:
-            if m not in bl_strength:      # EG bo qua (khong 1 baseline diem)
-                continue
-            d = bl_strength[m]
-            rows[m] = (sum(d["pf"]) / len(d["pf"]),
-                       sum(d["pb"]) / len(d["pb"]),
-                       sum(d["df"]) / len(d["df"]) if d.get("df") else float("nan"),
-                       sum(d["shift"]) / len(d["shift"]))
-        # ti gia bien: sai phan giua hai sigma LIEN TIEP tren truc sweep
-        shr = [f"Shrinkage-IG@{sg:g}" for sg in sorted(args.sigma_sweep)]
-        shr = [m for m in shr if m in rows]
-        rate = {}
-        for i in range(len(shr) - 1):
-            a, b = rows[shr[i]], rows[shr[i + 1]]
-            ddf, dds = b[2] - a[2], b[3] - a[3]
-            rate[shr[i]] = ddf / dds if abs(dds) > 1e-12 else float("nan")
-        if shr:
-            rate[shr[-1]] = rate.get(shr[-2], float("nan")) if len(shr) > 1 else float("nan")
+        print("[i]   Bang chinh in f(x) nhu MOT so = trung binh. Thuc te no BIEN THIEN manh.")
+        print("[i]   Δf = f(x)-f(b) ti le voi f(x); |b-x| thi khong => sigma toi uu phu thuoc")
+        print("[i]   f(x) => mot sigma toan cuc khong the dung cho moi anh (win% chi 33-38%).")
 
-        for m in metric_names:
-            if m not in rows:
-                continue
-            pf, pb, df_, sh = rows[m]
-            r = rate.get(m)
-            rtxt = f"{r:>16.5g}" if (r is not None and r == r) else f"{'-':>16}"
-            print(f"{m:<20}{pf:>9.4f}{pb:>9.4f}{df_:>10.4f}{sh:>11.4f}{rtxt}")
-        print("-" * 76)
-        print("[i] Δf = f(x)-f(b) = ngan sach Completeness. |b-x|₂ = quang duong.")
-        print("[i] d(Δf)/d|b-x| = TI GIA BIEN, chi tinh duoc giua cac hang CUNG TRUC sigma.")
-        print("[i]   Hang co dinh (black/white/noise/mean/blur/IG2/EG) khong nam tren truc do")
-        print("[i]   -> '-'. Nhung van doc duoc tren HAI cot Δf va |b-x|₂: cung Δf, ai di xa hon.")
-        print("[i] KHI Δf DA CHAM TRAN, moi baseline mua CUNG mot luong tin hieu; luc do xep hang")
-        print("[i]   I-D = xep hang QUANG DUONG THUA. So sanh truc tiep tren bang, dung doan.")
-        print("[i] Chay --tau_diag (dense sweep) de co ti gia bien tren grid day + sigma_rate.\n")
-
-    # ---- DENSE sigma sweep: knee / SNR, CHI forward pass ----
+    # ---- DENSE sigma sweep, CHI forward pass ----
     if getattr(args, "tau_diag", False):
         import tau_diag as _td
         import torch.nn.functional as F

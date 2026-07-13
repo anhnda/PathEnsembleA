@@ -40,6 +40,10 @@ from pea.resnet50_gradfn import (
 from pea.insdel import insertion_deletion
 from pea.methods import ig_single, eg
 from pea.spectral_reference import spectral_reference_fft
+from pea.baselines_rival import (
+    resnet50_penultimate, ig2_attribution, sample_counterfactual_ref,
+    max_entropy_baseline, ig_from_baseline, fringe_attribution,
+)
 
 
 def parse_args():
@@ -57,6 +61,12 @@ def parse_args():
     ap.add_argument("--eg_noise", type=float, default=1.0,
                     help="do lech chuan mau EG (khong gian da chuan hoa)")
     ap.add_argument("--no_fixed", action="store_true", help="bo cac baseline co dinh (chi Shrinkage + EG)")
+    # --- doi trong: IG2 / Max-Entropy / FRInGe ---
+    ap.add_argument("--rivals", action="store_true",
+                    help="bat cac doi trong IG2 / Max-Entropy / FRInGe")
+    ap.add_argument("--ig2_steps", type=int, default=30, help="so buoc GradPath cua IG2")
+    ap.add_argument("--me_steps", type=int, default=100, help="so buoc toi uu Max-Entropy baseline")
+    ap.add_argument("--rival_T", type=int, default=50, help="so buoc IG cho ME/FRInGe path")
     ap.add_argument("--chunk", type=int, default=16)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--seed", type=int, default=0)
@@ -133,7 +143,8 @@ def baseline_strength_row(model, x, baseline, target):
     return p_full, p_base, ratio, shift
 
 
-def attributions_for_image(x, grad_fn, args, device, seed):
+def attributions_for_image(x, grad_fn, args, device, seed,
+                           model=None, target=None, rep_fn=None, ref_pool=None, n_class=1000):
     """
     Chi IG + baseline (theo E1, path thang). Tra ve dict {method: attr(3,H,W)}.
       - Shrinkage-IG@sigma : baseline = Wiener low-pass FFT (blur), IG thang toi x.
@@ -156,6 +167,20 @@ def attributions_for_image(x, grad_fn, args, device, seed):
     for K in args.eg_K:
         pool = make_eg_pool(x, K, args.eg_noise, device, seed)
         out[f"EG-{K}"] = eg(x, pool, grad_fn, N=args.N)
+
+    # --- DOI TRONG: IG2 / Max-Entropy / FRInGe ---
+    if args.rivals and model is not None:
+        # Max-Entropy: baseline output ~ uniform, roi IG thang
+        b_me = max_entropy_baseline(model, x, n_class, steps=args.me_steps, device=device)
+        out["IG-MaxEnt"] = ig_from_baseline(x, b_me, grad_fn, T=args.rival_T)
+        # FRInGe: max-ent reference + Fisher-Rao geodesic path
+        out["FRInGe"] = fringe_attribution(model, x, target, n_class, grad_fn,
+                                           steps=args.rival_T, me_steps=args.me_steps, device=device)
+        # IG2: GradCF + GradPath (can reference lop khac + rep layer)
+        if rep_fn is not None and ref_pool is not None:
+            x_ref = sample_counterfactual_ref(model, x, target, ref_pool, device=device)
+            out["IG2"] = ig2_attribution(model, x, x_ref, target, rep_fn,
+                                         steps=args.ig2_steps, device=device)
     return out
 
 
@@ -314,6 +339,17 @@ def main():
 
     model = load_resnet50(device)
 
+    # --- chuan bi cho doi trong (rivals): rep layer + pool anh lam counterfactual ref ---
+    rep_fn = ref_pool = None
+    n_class = 1000
+    if args.rivals:
+        rep_fn = resnet50_penultimate(model)
+        from PIL import Image as _Img
+        pool_paths = paths[:min(8, len(paths))]     # dung vai anh dau lam pool CF
+        ref_pool = [preprocess(_Img.open(p), size=224, device=device) for p in pool_paths]
+        print(f"[i] RIVALS bat: IG2 (ig2_steps={args.ig2_steps}) / MaxEnt / FRInGe "
+              f"(me_steps={args.me_steps}), CF-pool={len(ref_pool)}\n")
+
     metric_names = None
     acc = {}
     per_image_rows = []
@@ -335,7 +371,9 @@ def main():
             d = bl_strength.setdefault(m, {"pf": [], "pb": [], "ratio": [], "shift": []})
             d["pf"].append(pf); d["pb"].append(pb); d["ratio"].append(ratio); d["shift"].append(shift)
 
-        attrs = attributions_for_image(x, grad_fn, args, device, args.seed)
+        attrs = attributions_for_image(x, grad_fn, args, device, args.seed,
+                                       model=model, target=target, rep_fn=rep_fn,
+                                       ref_pool=ref_pool, n_class=n_class)
         if metric_names is None:
             metric_names = list(attrs.keys())
             for m in metric_names:

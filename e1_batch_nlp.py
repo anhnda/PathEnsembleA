@@ -313,6 +313,7 @@ def main():
     metric_keys = ["soft_nc", "soft_ns", "soft_logodds"]
     acc = {m: {k: [] for k in metric_keys} for m in methods}
     per_rows = []
+    bl_strength = {}          # {method: {"pf":[], "pb":[], "ratio":[], "shift":[]}}  f(x) vs f(baseline)
 
     special_ids = set(tokenizer.all_special_ids)
 
@@ -352,6 +353,22 @@ def main():
                 _, attr_full = ig_embedding(fwd, model, word_embed, be, position_embed, type_embed,
                                             attn, pred_class, args.steps)
 
+                # --- DEBUG: baseline strength f(x) vs f(baseline) (softmax pred_class) ---
+                with torch.no_grad():
+                    pf = F.softmax(logits, dim=-1)[0, pred_class].item()
+                    lb = fwd(model, be, attention_mask=attn,
+                             position_embed=position_embed, type_embed=type_embed)
+                    pb = F.softmax(lb, dim=-1)[0, pred_class].item()
+                    # |b-x| chi tren token thuong (bo special) neu co the
+                    diff = (be - word_embed).abs()
+                    if not args.include_special and keep_tok.any():
+                        shift = diff[0][keep_tok].mean().item()
+                    else:
+                        shift = diff.mean().item()
+                d = bl_strength.setdefault(nm, {"pf": [], "pb": [], "ratio": [], "shift": []})
+                d["pf"].append(pf); d["pb"].append(pb)
+                d["ratio"].append(pb / pf if pf > 1e-9 else float("nan")); d["shift"].append(shift)
+
             # attr_token cho soft metric: soft_faith nhan attr theo TOKEN (seq,)
             attr_token = attr_full.sum(dim=-1).squeeze(0)  # (seq,)
             attr_for_metric = attr_token.clone()
@@ -383,27 +400,41 @@ def main():
     for m in methods:
         acc[m]["soft_gap"] = [nc + ns - 1.0
                               for nc, ns in zip(acc[m]["soft_nc"], acc[m]["soft_ns"])]
-    print(f"\n{'='*96}\nKET QUA E1-NLP tren {n} cau  ({args.model}/{args.dataset})")
-    print(f"{'method':<20}{'Soft-NC↑':>15}{'Soft-NS↑':>15}{'Soft-gap↑':>15}{'Soft-logodds↑':>18}")
-    print("-" * 96)
-    best_gap, best_m = -float("inf"), None
+    print(f"\n{'='*116}\nKET QUA E1-NLP tren {n} cau  ({args.model}/{args.dataset})")
+    print(f"{'method':<20}{'Soft-NC↑':>15}{'Soft-NS↑':>15}{'Soft-gap↑':>15}{'Soft-logodds↑':>18}"
+          f"{'f(x)':>8}{'f(xt)':>8}{'ratio':>8}{'|b-x|':>9}")
+    print("-" * 116)
+    # best theo Soft-gap (tinh truoc de danh dau)
+    gap_means = {m: mean_se(acc[m]["soft_gap"])[0] for m in methods}
+    best_m = max(gap_means, key=gap_means.get)
+    best_gap = gap_means[best_m]
     summary_rows = []
     for m in methods:
         nc_m, nc_se = mean_se(acc[m]["soft_nc"])
         ns_m, ns_se = mean_se(acc[m]["soft_ns"])
         gp_m, gp_se = mean_se(acc[m]["soft_gap"])
         lo_m, lo_se = mean_se(acc[m]["soft_logodds"])
-        if gp_m > best_gap:
-            best_gap, best_m = gp_m, m
+        # f(x)/f(xt)/ratio/|b-x| (EG khong co baseline diem -> "-")
+        fx, fxt, rtxt, stxt = "   -  ", "   -  ", "   -  ", "    -   "
+        if m in bl_strength:
+            d = bl_strength[m]
+            if d["pf"]:   fx  = f"{sum(d['pf'])/len(d['pf']):>6.4f}"
+            if d["pb"]:   fxt = f"{sum(d['pb'])/len(d['pb']):>6.4f}"
+            rr = [r for r in d["ratio"] if r == r]
+            if rr:        rtxt = f"{sum(rr)/len(rr):>6.4f}"
+            if d["shift"]:stxt = f"{sum(d['shift'])/len(d['shift']):>8.4f}"
+        mark = "  <-- best" if m == best_m else ""
         print(f"{m:<20}{nc_m:>8.4f}±{nc_se:<5.4f}{ns_m:>8.4f}±{ns_se:<5.4f}"
-              f"{gp_m:>8.4f}±{gp_se:<5.4f}{lo_m:>10.4f}±{lo_se:<6.4f}")
+              f"{gp_m:>8.4f}±{gp_se:<5.4f}{lo_m:>10.4f}±{lo_se:<6.4f}"
+              f"{fx:>8}{fxt:>8}{rtxt:>8}{stxt:>9}{mark}")
         summary_rows.append({"method": m, "n": n,
                              "soft_nc_mean": nc_m, "soft_nc_se": nc_se,
                              "soft_ns_mean": ns_m, "soft_ns_se": ns_se,
                              "soft_gap_mean": gp_m, "soft_gap_se": gp_se,
                              "soft_logodds_mean": lo_m, "soft_logodds_se": lo_se})
-    print("-" * 96)
+    print("-" * 116)
     print(f"[i] dan dau Soft-gap (=NC+NS-1): {best_m} = {best_gap:.4f}")
+    print("[i] ratio~1 => baseline chua xoa gi; ratio thap => trung tinh/lat lop (vd IG-zero OOD).")
 
     # ---- Paired test: Shrinkage(tot nhat theo Soft-gap) vs baseline ----
     shr = [m for m in methods if m.startswith("Shrinkage-IG")]

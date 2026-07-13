@@ -106,6 +106,33 @@ def make_eg_pool(x, K, noise, device, seed):
     return x[None] + eps                                   # (K,3,H,W)
 
 
+def collect_baselines_for_image(x, args, device, seed):
+    """
+    Tra ve dict {method: baseline_tensor(3,H,W)} — DUNG cach attribution tao baseline,
+    de debug f(x) vs f(baseline). Shrinkage-IG@sigma -> Wiener low-pass FFT;
+    IG-<fixed> -> black/white/noise/mean/blur. (EG bo qua: baseline la pool, khong 1 diem.)
+    """
+    out = {}
+    for sig in args.sigma_sweep:
+        out[f"Shrinkage-IG@{sig:g}"] = spectral_reference_fft(x, sigma=sig)
+    if not args.no_fixed:
+        names, fixed = make_fixed_baselines(x, device, seed)
+        for nm, b in zip(names, fixed):
+            out[f"IG-{nm}"] = b
+    return out
+
+
+@torch.no_grad()
+def baseline_strength_row(model, x, baseline, target):
+    """p_full=f(x), p_base=f(baseline) (softmax target), ratio, mean|b-x|."""
+    import torch.nn.functional as F
+    p_full = F.softmax(model(x[None]), 1)[0, target].item()
+    p_base = F.softmax(model(baseline[None]), 1)[0, target].item()
+    ratio = p_base / p_full if p_full > 1e-9 else float("nan")
+    shift = (baseline - x).abs().mean().item()
+    return p_full, p_base, ratio, shift
+
+
 def attributions_for_image(x, grad_fn, args, device, seed):
     """
     Chi IG + baseline (theo E1, path thang). Tra ve dict {method: attr(3,H,W)}.
@@ -278,6 +305,7 @@ def main():
     acc = {}
     per_image_rows = []
     id_per_image = []
+    bl_strength = {}          # {method: {"pf":[], "pb":[], "ratio":[], "shift":[]}}
 
     for ip, path in enumerate(paths):
         x = preprocess(Image.open(path), size=224, device=device)
@@ -287,6 +315,12 @@ def main():
         else:
             target = args.target
         grad_fn = make_resnet50_gradfn(model, target, device, chunk=args.chunk, score=args.score)
+
+        # --- DEBUG: baseline strength f(x) vs f(baseline) ---
+        for m, b in collect_baselines_for_image(x, args, device, args.seed).items():
+            pf, pb, ratio, shift = baseline_strength_row(model, x, b, target)
+            d = bl_strength.setdefault(m, {"pf": [], "pb": [], "ratio": [], "shift": []})
+            d["pf"].append(pf); d["pb"].append(pb); d["ratio"].append(ratio); d["shift"].append(shift)
 
         attrs = attributions_for_image(x, grad_fn, args, device, args.seed)
         if metric_names is None:
@@ -323,6 +357,24 @@ def main():
     print("\n" + "=" * 80)
     best_overall = _print_summary_table(metric_names, acc, id_per_image, n_img,
                                         title=f"KET QUA CUOI CUNG tren {n_img} anh")
+
+    # ---- DEBUG: bang baseline strength f(x) vs f(baseline), trung binh tren anh ----
+    if bl_strength:
+        print("\n[DEBUG] baseline strength: f(x) vs f(baseline)  (softmax target, TB tren anh)")
+        print(f"{'method':<20}{'p_full':>9}{'p_base':>9}{'ratio p_base/p_full':>22}{'mean|b-x|':>12}")
+        print("-" * 72)
+        for m in metric_names:
+            if m not in bl_strength:      # EG bo qua (khong 1 baseline diem)
+                continue
+            d = bl_strength[m]
+            mpf = sum(d["pf"]) / len(d["pf"])
+            mpb = sum(d["pb"]) / len(d["pb"])
+            rr = [r for r in d["ratio"] if r == r]
+            mr = sum(rr) / len(rr) if rr else float("nan")
+            msh = sum(d["shift"]) / len(d["shift"])
+            print(f"{m:<20}{mpf:>9.4f}{mpb:>9.4f}{mr:>22.4f}{msh:>12.4f}")
+        print("-" * 72)
+        print("[i] ratio~1 => baseline chua xoa gi (sigma nho); ratio thap => trung tinh/lat lop (vd black OOD).\n")
 
     summary_rows = []
     for m in metric_names:

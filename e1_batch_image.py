@@ -589,6 +589,24 @@ def main():
                 name = _r.replace("tau_", "")          # rate / knee
                 for i in range(len(_imgs)):
                     adaptive_sigma_per_image[i][name] = float(_t[i])
+
+            # --- KNEE OVERRIDE: Kneedle chuan tren (index, f_b), PER-IMAGE ---
+            # selection_rules dinh nghia tau_knee = argmax do-doc cua f_b (khoang tut
+            # manh nhat). Day KHONG phai Kneedle. Kneedle that = chuan hoa (index, f_b)
+            # ve [0,1], f_b GIAM => knee = diem xa duong cheo nhat: argmax (1-x_hat) - y_hat.
+            # Truc x = INDEX cua sweep (grid log-deu => i ∝ log sigma), PER-IMAGE vi
+            # b_sigma(x) phu thuoc x. Ghi de len 'knee' o tren.
+            _fb = curve_pp["rho"] * curve_pp["f_x"][:, None]        # (M,T) f(b) per-image
+            _M, _T = _fb.shape
+            _sg = curve_pp["taus"]                                  # (T,) = sig_grid
+            _lo = _fb.min(dim=1, keepdim=True).values
+            _rng = (_fb.max(dim=1, keepdim=True).values - _lo).clamp_min(1e-12)
+            _yh = (_fb - _lo) / _rng                                # (M,T) giam ~1 -> 0
+            _xh = torch.arange(_T, device=_fb.device).float() / max(_T - 1, 1)   # (T,)
+            _kscore = (1.0 - _xh)[None] - _yh                       # (M,T)
+            _j_knee = _kscore.argmax(dim=1)                         # (M,) diem xa cheo nhat
+            for i in range(_M):
+                adaptive_sigma_per_image[i]["knee"] = float(_sg[_j_knee[i]])
         _rules_found = sorted({r for d in adaptive_sigma_per_image for r in d})
         if _rules_found:
             print(f"[i] Shrinkage-Adaptive rule: {', '.join(_rules_found)} "

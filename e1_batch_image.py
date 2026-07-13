@@ -266,29 +266,33 @@ def _print_summary_table(metric_names, acc, id_per_image, n_img, title, bl_stren
     win_count = {m: 0 for m in metric_names}
     for d in id_per_image:
         win_count[max(d, key=d.get)] += 1
+    # tim best I-D truoc de danh dau
+    id_means = {m: mean_se(acc[m]["id"])[0] for m in metric_names}
+    best_m = max(id_means, key=id_means.get)
+
     print(f"\n--- {title} (mean±SE tren {n_img} anh) ---")
-    print(f"{'method':<20}{'insertion↑':>16}{'deletion↓':>16}{'I-D↑':>16}{'win%':>8}"
-          f"{'ratio':>9}{'|b-x|':>9}")
-    print("-" * 94)
-    best_m, best_id = None, -float("inf")
+    print(f"{'method':<20}{'insertion↑':>16}{'deletion↓':>16}{'I-D↑':>16}{'win%':>7}"
+          f"{'f(x)':>8}{'f(xt)':>8}{'ratio':>8}{'|b-x|':>8}")
+    print("-" * 107)
     for m in metric_names:
         im, ise = mean_se(acc[m]["ins"])
         dm, dse = mean_se(acc[m]["del"])
         idm, idse = mean_se(acc[m]["id"])
         winp = 100.0 * win_count[m] / n_img if n_img else 0.0
-        if idm > best_id:
-            best_id, best_m = idm, m
-        # ratio f(base)/f(x) + shift |b-x| (neu co; EG khong co -> "-")
-        rtxt, stxt = "     -   ", "     -   "
+        # f(x)=p_full, f(xt)=p_base, ratio, shift |b-x| (EG khong co -> "-")
+        fx, fxt, rtxt, stxt = "   -  ", "   -  ", "   -  ", "   -  "
         if bl_strength and m in bl_strength:
             d = bl_strength[m]
+            if d["pf"]:   fx  = f"{sum(d['pf'])/len(d['pf']):>6.4f}"
+            if d["pb"]:   fxt = f"{sum(d['pb'])/len(d['pb']):>6.4f}"
             rr = [r for r in d["ratio"] if r == r]
-            if rr: rtxt = f"{sum(rr)/len(rr):>9.4f}"
-            if d["shift"]: stxt = f"{sum(d['shift'])/len(d['shift']):>9.4f}"
+            if rr:        rtxt = f"{sum(rr)/len(rr):>6.4f}"
+            if d["shift"]:stxt = f"{sum(d['shift'])/len(d['shift']):>6.4f}"
+        mark = "  <-- best" if m == best_m else ""
         print(f"{m:<20}{im:>8.4f}±{ise:<6.4f}{dm:>8.4f}±{dse:<6.4f}{idm:>8.4f}±{idse:<6.4f}"
-              f"{winp:>7.1f}%{rtxt}{stxt}")
-    print("-" * 94)
-    print(f"[i] dan dau I-D: {best_m} = {best_id:.4f}")
+              f"{winp:>6.1f}%{fx:>8}{fxt:>8}{rtxt:>8}{stxt:>8}{mark}")
+    print("-" * 107)
+    print(f"[i] dan dau I-D: {best_m} = {id_means[best_m]:.4f}")
     return best_m
 
 

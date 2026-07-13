@@ -312,7 +312,8 @@ def wilcoxon(a, b):
     return (W, z, p)
 
 
-def _print_summary_table(metric_names, acc, id_per_image, n_img, title, bl_strength=None):
+def _print_summary_table(metric_names, acc, id_per_image, n_img, title, bl_strength=None,
+                         sigma_sweep=None, eps=0.05):
     win_count = {m: 0 for m in metric_names}
     for d in id_per_image:
         win_count[max(d, key=d.get)] += 1
@@ -320,10 +321,35 @@ def _print_summary_table(metric_names, acc, id_per_image, n_img, title, bl_stren
     id_means = {m: mean_se(acc[m]["id"])[0] for m in metric_names}
     best_m = max(id_means, key=id_means.get)
 
+    # ---- TI GIA BIEN d(Δf)/d|b-x|, tinh giua cac sigma LIEN TIEP tren truc sweep ----
+    # Day la dai luong DUY NHAT can de chon sigma. No noi: di them 1 don vi quang
+    # duong thi mua duoc bao nhieu tin hieu. Chi tinh duoc giua cac hang CUNG TRUC.
+    rate, sig_star, by_eps, rmax_r = {}, None, {}, None
+    if bl_strength and sigma_sweep:
+        shr = [f"Shrinkage-IG@{sg:g}" for sg in sorted(sigma_sweep)]
+        shr = [m for m in shr if m in bl_strength and bl_strength[m].get("df")]
+        pt = {m: (sum(bl_strength[m]["df"]) / len(bl_strength[m]["df"]),
+                  sum(bl_strength[m]["shift"]) / len(bl_strength[m]["shift"])) for m in shr}
+        r_int = []                                    # ti gia cua KHOANG [j, j+1]
+        for j in range(len(shr) - 1):
+            (df_a, s_a), (df_b, s_b) = pt[shr[j]], pt[shr[j + 1]]
+            ds = s_b - s_a
+            r_int.append((df_b - df_a) / ds if abs(ds) > 1e-12 else float("nan"))
+            rate[shr[j]] = r_int[-1]                  # gan cho DIEM DAU khoang
+        # diem cuoi grid: KHONG co khoang sau no => KHONG co ti gia. De trong.
+        # sigma_rate = DIEM CUOI cua khoang tot cuoi cung (ti gia >= eps * max)
+        good = [r for r in r_int if r == r and r > 0]
+        if good:
+            rmax_r = max(good)
+            for e in (0.5, 0.2, 0.1, 0.05, 0.01):
+                js = [j for j, r in enumerate(r_int) if r == r and r >= e * rmax_r]
+                by_eps[e] = shr[max(js) + 1] if js else shr[0]
+            sig_star = by_eps.get(eps)
+
     print(f"\n--- {title} (mean±SE tren {n_img} anh) ---")
     print(f"{'method':<20}{'insertion↑':>16}{'deletion↓':>16}{'I-D↑':>16}{'win%':>7}"
-          f"{'f(x)':>8}{'f(b)':>8}{'Δf':>9}{'|b-x|₂':>10}")
-    print("-" * 129)
+          f"{'f(x)':>8}{'f(b)':>8}{'Δf':>9}{'|b-x|₂':>10}{'d(Δf)/d|b-x|':>15}")
+    print("-" * 137)
     for m in metric_names:
         im, ise = mean_se(acc[m]["ins"])
         dm, dse = mean_se(acc[m]["del"])
@@ -338,11 +364,30 @@ def _print_summary_table(metric_names, acc, id_per_image, n_img, title, bl_stren
             if d["pb"]:   fxt = f"{sum(d['pb'])/len(d['pb']):>6.4f}"
             if d.get("df"): dftxt = f"{sum(d['df'])/len(d['df']):>8.4f}"
             if d["shift"]:stxt = f"{sum(d['shift'])/len(d['shift']):>9.4f}"
-        mark = "  <-- best" if m == best_m else ""
+        r = rate.get(m)
+        rtxt = f"{r:>15.4g}" if (r is not None and r == r) else f"{'-':>15}"
+        mark = ""
+        if m == best_m:
+            mark += "  <-- best I-D"
+        if m == sig_star:
+            mark += "  <== sigma_rate"
         print(f"{m:<20}{im:>8.4f}±{ise:<6.4f}{dm:>8.4f}±{dse:<6.4f}{idm:>8.4f}±{idse:<6.4f}"
-              f"{winp:>6.1f}%{fx:>8}{fxt:>8}{dftxt:>9}{stxt:>10}{mark}")
-    print("-" * 115)
+              f"{winp:>6.1f}%{fx:>8}{fxt:>8}{dftxt:>9}{stxt:>10}{rtxt}{mark}")
+    print("-" * 137)
     print(f"[i] dan dau I-D: {best_m} = {id_means[best_m]:.4f}")
+    print("[i] Δf = f(x)-f(b) = ngan sach Completeness. |b-x|₂ = quang duong (L2).")
+    print("[i] d(Δf)/d|b-x| = ti gia bien, gan cho DIEM DAU cua khoang [sigma_j, sigma_j+1].")
+    print("[i]   Hang cuoi grid va hang co dinh (black/blur/EG/IG2) khong nam tren truc -> '-'.")
+    if by_eps:
+        print(f"\n[i] sigma_rate theo eps (KHONG cham I-D, chi forward pass). ti gia max = {rmax_r:.5g}")
+        print(f"{'eps':>8}{'nguong':>14}{'sigma_rate':>22}{'   == best?':>12}")
+        print("-" * 58)
+        for e, m in by_eps.items():
+            ok = "KHOP" if m == best_m else "LECH"
+            print(f"{e:>8g}{e*rmax_r:>14.5g}{m:>22}{ok:>12}")
+        print("-" * 58)
+        print("[i] IN CA DAI eps. KHONG tu chon mot eps roi bao la rule — chon eps sau khi")
+        print("[i]   nhin dap an chinh la cai ma draft dang chi trich BEE.")
     return best_m
 
 
@@ -428,6 +473,7 @@ def main():
         print(f"[{ip+1}/{len(paths)}] {os.path.basename(path):<24} best={best_m} ({img_ids[best_m]:.3f})")
         if args.report_every > 0 and ((ip + 1) % args.report_every == 0 or ip + 1 == len(paths)):
             _print_summary_table(metric_names, acc, id_per_image, ip + 1, bl_strength=bl_strength,
+                                 sigma_sweep=args.sigma_sweep,
                                  title=f"TICH LUY sau {ip+1} anh")
 
     n_img = len(id_per_image)
@@ -437,6 +483,7 @@ def main():
 
     print("\n" + "=" * 80)
     best_overall = _print_summary_table(metric_names, acc, id_per_image, n_img, bl_strength=bl_strength,
+                                        sigma_sweep=args.sigma_sweep,
                                         title=f"KET QUA CUOI CUNG tren {n_img} anh")
 
     # ---- DIAGNOSTIC: baseline strength, PER-IMAGE (khong bop phang f(x)) ----

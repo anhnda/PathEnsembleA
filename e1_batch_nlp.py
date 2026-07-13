@@ -581,10 +581,33 @@ def main():
     for m in methods:
         acc[m]["soft_gap"] = [nc + ns - 1.0
                               for nc, ns in zip(acc[m]["soft_nc"], acc[m]["soft_ns"])]
+    # ---- TI GIA BIEN d(Δf)/d|b-x|, giua cac tau LIEN TIEP tren truc sweep ----
+    # rate[j] = ti gia cua KHOANG [tau_j, tau_{j+1}], gan cho DIEM DAU khoang.
+    # Hang cuoi grid va hang co dinh (zero/pad/mask/EG/IG2/...) khong nam tren truc
+    # -> khong co ti gia -> in "-". Van doc duoc tren HAI cot Δf va |b-x|₂.
+    rate, tau_rate_by_eps, rmax_r = {}, {}, None
+    shr_axis = [f"Shrinkage-IG@{t:g}" for t in sorted(args.tau_sweep)]
+    shr_axis = [m for m in shr_axis if m in bl_strength and bl_strength[m].get("df")]
+    if len(shr_axis) >= 2:
+        pt = {m: (sum(bl_strength[m]["df"]) / len(bl_strength[m]["df"]),
+                  sum(bl_strength[m]["shift"]) / len(bl_strength[m]["shift"])) for m in shr_axis}
+        r_int = []
+        for j in range(len(shr_axis) - 1):
+            (df_a, s_a), (df_b, s_b) = pt[shr_axis[j]], pt[shr_axis[j + 1]]
+            ds = s_b - s_a
+            r_int.append((df_b - df_a) / ds if abs(ds) > 1e-12 else float("nan"))
+            rate[shr_axis[j]] = r_int[-1]
+        good = [r for r in r_int if r == r and r > 0]
+        if good:
+            rmax_r = max(good)
+            for eps in (0.5, 0.2, 0.1, 0.05, 0.01):
+                js = [j for j, r in enumerate(r_int) if r == r and r >= eps * rmax_r]
+                tau_rate_by_eps[eps] = shr_axis[max(js) + 1] if js else shr_axis[0]
+
     print(f"\n{'='*116}\nKET QUA E1-NLP tren {n} cau  ({args.model}/{args.dataset})")
     print(f"{'method':<20}{'Soft-NC↑':>15}{'Soft-NS↑':>15}{'Soft-gap↑':>15}{'Soft-logodds↑':>18}"
-          f"{'f(x)':>8}{'f(b)':>8}{'Δf':>9}{'|b-x|₂':>10}")
-    print("-" * 118)
+          f"{'f(x)':>8}{'f(b)':>8}{'Δf':>9}{'|b-x|₂':>10}{'d(Δf)/d|b-x|':>15}")
+    print("-" * 133)
     # best theo Soft-gap (tinh truoc de danh dau)
     gap_means = {m: mean_se(acc[m]["soft_gap"])[0] for m in methods}
     best_m = max(gap_means, key=gap_means.get)
@@ -605,18 +628,31 @@ def main():
             if d["pb"]:   fxt = f"{sum(d['pb'])/len(d['pb']):>6.4f}"
             if d["df"]:   dftxt = f"{sum(d['df'])/len(d['df']):>8.4f}"
             if d["shift"]:stxt = f"{sum(d['shift'])/len(d['shift']):>9.4f}"
+        r = rate.get(m)
+        rtxt = f"{r:>15.4g}" if (r is not None and r == r) else f"{'-':>15}"
         mark = "  <-- best" if m == best_m else ""
         print(f"{m:<20}{nc_m:>8.4f}±{nc_se:<5.4f}{ns_m:>8.4f}±{ns_se:<5.4f}"
               f"{gp_m:>8.4f}±{gp_se:<5.4f}{lo_m:>10.4f}±{lo_se:<6.4f}"
-              f"{fx:>8}{fxt:>8}{dftxt:>9}{stxt:>10}{mark}")
+              f"{fx:>8}{fxt:>8}{dftxt:>9}{stxt:>10}{rtxt}{mark}")
         summary_rows.append({"method": m, "n": n,
                              "soft_nc_mean": nc_m, "soft_nc_se": nc_se,
                              "soft_ns_mean": ns_m, "soft_ns_se": ns_se,
                              "soft_gap_mean": gp_m, "soft_gap_se": gp_se,
                              "soft_logodds_mean": lo_m, "soft_logodds_se": lo_se})
-    print("-" * 116)
+    print("-" * 133)
     print(f"[i] dan dau Soft-gap (=NC+NS-1): {best_m} = {best_gap:.4f}")
-    print("[i] ratio~1 => baseline chua xoa gi; ratio thap => trung tinh/lat lop (vd IG-zero OOD).")
+    print("[i] Δf = f(x)-f(b) = ngan sach Completeness. |b-x|₂ = quang duong (L2).")
+    print("[i] d(Δf)/d|b-x| = ti gia bien, gan cho DIEM DAU cua khoang [tau_j, tau_j+1].")
+    if tau_rate_by_eps:
+        print(f"\n[i] tau_rate theo eps (KHONG cham Soft-gap, chi forward pass). ti gia max = {rmax_r:.5g}")
+        print(f"{'eps':>8}{'nguong':>14}{'tau_rate':>22}{'   == best?':>12}")
+        print("-" * 58)
+        for eps, m in tau_rate_by_eps.items():
+            ok = "KHOP" if m == best_m else "LECH"
+            print(f"{eps:>8g}{eps*rmax_r:>14.5g}{m:>22}{ok:>12}")
+        print("-" * 58)
+        print("[i] IN CA DAI eps. KHONG tu chon mot eps roi bao la rule — chon eps sau khi")
+        print("[i]   nhin dap an chinh la cai ma draft dang chi trich BEE.")
 
     # ---- Paired test: Shrinkage(tot nhat theo Soft-gap) vs baseline ----
     shr = [m for m in methods if m.startswith("Shrinkage-IG")]

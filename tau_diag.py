@@ -306,9 +306,14 @@ def selection_rules(curve: dict, eps: float = 0.05):
                   tabular: ti gia VAN TANG tai @100  -> di tiep (grid cut dau)
                 Neu rule roi vao DIEM CUOI grid => grid cut dau, phai noi rong.
 
-    tau_knee  : DOI CHUNG. Kneedle tren (log tau, Δf) — diem gay.
-                SAI o tabular (chon @1, best la @100). Giu lai de THAY RO no sai,
-                chu khong phai de dung.
+    tau_knee  : Kneedle PER-INPUT tren [i, f_i].
+                truc x = INDEX cua sweep; truc y = f(b_tau(x)) cua CHINH input do.
+                Moi input mot knee (vi b_tau(x) phu thuoc x). In phan bo, khong
+                in mot con so chung.
+                LUU Y: index KHONG phai dai luong vat ly => phu thuoc GRID.
+                Them/bot diem sweep o vung bao hoa se KEO GIAN index va DICH knee.
+                Bang chung: tabular, grid 5 diem cho knee @1; them 200/300/400/1000
+                (deu la MEAN baseline, f(b) da dung yen) thi knee nhay sang @100.
 
     (Da bo tau_amp: no can K => modality-specific => bang cross-modality vo nghia.)
     """
@@ -343,15 +348,31 @@ def selection_rules(curve: dict, eps: float = 0.05):
     out["tau_rate"] = taus[idx_star]
     at_edge = float((idx_star[valid] == T - 1).float().mean().item()) if int(valid.sum()) else 0.0
 
-    # --- tau_knee (doi chung) ---
-    log_tau = taus.log()
-    xx = (log_tau - log_tau.min()); xx = xx / xx.max().clamp_min(1e-12)
-    idx = []
-    for i in range(M):
-        y = torch.cummax(df[i].clamp_min(0), dim=0).values        # ep tang don dieu
-        yy = (y - y.min()); yy = yy / yy.max().clamp_min(1e-12)
-        idx.append(int((yy - xx).argmax().item()))                # Kneedle cho duong TANG
-    out["tau_knee"] = taus[torch.tensor(idx, device=dev)]
+    # --- tau_knee: Kneedle PER-INPUT tren [i, f_i] ---
+    #
+    # HAI LOI DA MAC:
+    #
+    # (1) TRUNG BINH ROI TIM KNEE, thay vi TIM KNEE ROI XEM PHAN BO.
+    #     b_tau(x) PHU THUOC x => moi input co duong cong f(b_tau(x)) RIENG, knee RIENG,
+    #     tau toi uu RIENG. Bang chung: ORACLE per-input IQR [0.076, 0.961] — trai hon
+    #     mot bac. Va win% o vision chi 33-38% => mot sigma toan cuc chi dung cho 1/3 anh.
+    #     Trung binh cac duong cong lam MO knee: input A gay o tau=0.1, input B gay o
+    #     tau=2 => duong trung binh thoai, khong co gay ro.
+    #
+    # (2) SAI TRUC. Da code Kneedle tren (log tau, Δf) + cummax. Phai la [i, f_i]:
+    #       truc x = INDEX i cua sweep (0..T-1), chuan hoa [0,1]
+    #       truc y = f(b_tau_i(x)) cua CHINH input do, chuan hoa [0,1] theo min/max
+    #                cua CHINH no (khong phai min/max toan cuc)
+    #     Duong cong GIAM => knee = max (1 - x̂) - ŷ.
+    #     Do la ly do tau_knee = day grid o MOI input (0.00047, IQR bang 0): sai ham,
+    #     khong phai sai du lieu.
+    f_b = curve["rho"] * curve["f_x"][:, None]                    # (M,T) f(b) PER-INPUT
+    xh = torch.arange(T, device=dev, dtype=torch.float) / max(T - 1, 1)   # (T,) index chuan hoa
+    lo = f_b.min(dim=1, keepdim=True).values
+    hi = f_b.max(dim=1, keepdim=True).values
+    yh = (f_b - lo) / (hi - lo).clamp_min(1e-12)                  # (M,T) giam 1 -> 0
+    dev_knee = (1.0 - xh[None]) - yh                              # (M,T)
+    out["tau_knee"] = taus[dev_knee.argmax(dim=1)]
 
     out["_at_edge"] = at_edge
     return out, valid
@@ -394,6 +415,49 @@ def print_curve_table(curve: dict, tag: str = ""):
     print("[i]   Dung khi ti gia tut => tau_rate. Xem bang rules ben duoi.")
 
 
+def print_per_input_agreement(rules: dict, oracle, taus, valid=None):
+    """
+    BANG QUAN TRONG NHAT: rule co bat duoc BIEN THIEN GIUA CAC INPUT khong?
+
+    Mot rule co the co median trung ORACLE median ma van vo dung, neu no tra ve
+    CUNG MOT tau cho moi input trong khi ORACLE trai rong.
+
+    In:
+      - IQR cua rule vs IQR cua ORACLE  (rule co trai KHONG?)
+      - % khop chinh xac / trong 1 buoc grid
+      - correlation Spearman giua rule va ORACLE tren log tau
+    """
+    rules = {k: v for k, v in rules.items() if not k.startswith("_")}
+    if valid is not None:
+        rules = {k: v[valid] for k, v in rules.items()}
+        oracle = oracle[valid]
+    lt = taus.log()
+    io = (oracle[:, None].clamp_min(1e-30).log() - lt[None]).abs().argmin(1)
+
+    def _rank(v):
+        return v.argsort().argsort().float()
+
+    print(f"\n=== RULE CO BAT DUOC BIEN THIEN GIUA CAC INPUT KHONG? ===")
+    print(f"{'rule':<14}{'median':>10}{'IQR':>22}{'== orc':>9}{'<=1 buoc':>10}{'spearman':>10}")
+    print("-" * 76)
+    q = torch.tensor([0.25, 0.5, 0.75]).double()
+    for name, t in rules.items():
+        it = (t[:, None].clamp_min(1e-30).log() - lt[None]).abs().argmin(1)
+        qq = torch.quantile(t.double().cpu(), q)
+        ex = (it == io).float().mean().item() * 100
+        nr = ((it - io).abs() <= 1).float().mean().item() * 100
+        a, b = _rank(t.log()), _rank(oracle.log())
+        sp = float(torch.corrcoef(torch.stack([a, b]))[0, 1]) if t.numel() > 2 else float("nan")
+        print(f"{name:<14}{qq[1]:>10.4g}   [{qq[0]:.4g}, {qq[2]:.4g}]{'':>3}"
+              f"{ex:>8.1f}%{nr:>9.1f}%{sp:>10.3f}")
+    qo = torch.quantile(oracle.double().cpu(), q)
+    print(f"{'ORACLE':<14}{qo[1]:>10.4g}   [{qo[0]:.4g}, {qo[2]:.4g}]")
+    print("-" * 76)
+    print("[i] IQR cua rule HEP ma ORACLE RONG => rule tra ve gan nhu CUNG MOT tau cho moi")
+    print("[i]   input => KHONG bat duoc bien thien => vo dung du median co trung.")
+    print("[i] spearman = tuong quan hang giua rule va ORACLE tren log tau. ~0 => khong lien quan.")
+
+
 def print_rules_table(rules: dict, oracle=None, valid=None):
     rules = dict(rules)
     at_edge = rules.pop("_at_edge", None)
@@ -413,17 +477,18 @@ def print_rules_table(rules: dict, oracle=None, valid=None):
         qq = torch.quantile(oracle.double().cpu(), q3)
         print(f"{'ORACLE(I-D)':<12}{qq[1]:>11.4g}{oracle.mean():>11.4g}   [{qq[0]:.4g}, {qq[2]:.4g}]")
     print("-" * 74)
-    print("[i] tau_rate = RULE CHINH (ti gia bien). tau_knee = DOI CHUNG.")
-    print("[i] tau_knee SAI o tabular: no chon diem gay, nhung o tabular ||b-x|| bao hoa CUNG LUC")
-    print("[i]   voi Δf (ca hai hoi tu khi b->mu) => khong co quang duong thua => khong co ly do")
-    print("[i]   dung o gay. Best that = cuoi grid (@100). Giu tau_knee de THAY RO no sai.")
+    print("[i] tau_rate = ti gia bien.  tau_knee = Kneedle PER-INPUT tren [i, f(b)].")
+    print("[i] CA HAI deu la rule per-input: b_tau(x) phu thuoc x => moi input mot tau rieng.")
+    print("[i]   Cot IQR cho thay do trai. Neu IQR hep ma ORACLE trai rong => rule khong bat")
+    print("[i]   duoc bien thien giua cac input.")
+    print("[!] tau_knee dung INDEX lam truc x => PHU THUOC GRID. Them diem sweep o vung")
+    print("[!]   bao hoa (b da = mean, f(b) dung yen) se KEO GIAN index va DICH knee.")
     if oracle is not None:
         print("[i] Neu tau_rate ~ ORACLE => chon duoc tau MA KHONG cham test metric. Do la ket qua chinh.")
     if at_edge is not None and at_edge > 0.3:
         print(f"[!!] {at_edge*100:.0f}% input co tau_rate = CUOI GRID  =>  GRID CUT DAU.")
         print(f"[!!]  Ti gia bien VAN CON CAO o tau lon nhat: baseline chua di het duong.")
-        print(f"[!!]  Noi rong grid roi chay lai. (Dung y het log tabular: @100 van dan dau,")
-        print(f"[!!]  Δf van dang tang, ti gia @10->@100 = 9.27 > ti gia @1->@10 = 5.86.)")
+        print(f"[!!]  Noi rong grid roi chay lai — HOAC ti gia bien khong phai rule dung o day.")
 
 
 def dump_curve_csv(curve: dict, path: str, extra_cols: dict | None = None):

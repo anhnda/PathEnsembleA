@@ -392,6 +392,8 @@ def main():
         # (5) Selection rules — deu CHI dung forward pass
         rules, valid_m = tau_diag.selection_rules(curve, eps=args.diag_eps)
         tau_diag.print_rules_table(rules, oracle=oracle, valid=valid_m)
+        if oracle is not None:
+            tau_diag.print_per_input_agreement(rules, oracle, curve["taus"], valid=valid_m)
 
         # (6) CSV long-format — de fit rule offline, dung suy dien tu 4 diem nua
         extra = {"id_gap": curve["_id_per_tau"]} if "_id_per_tau" in curve else None

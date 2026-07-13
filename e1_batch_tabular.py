@@ -50,6 +50,7 @@ from pea.baselines_rival import (
     max_entropy_baseline_tab, ig_from_baseline_tab, fringe_tabular,
 )
 import tau_diag
+import tau_star as taustar
 
 
 DATASETS = {
@@ -89,6 +90,9 @@ def parse_args():
     ap.add_argument("--insdel_steps", type=int, default=None, help="so buoc ins/del (mac dinh D)")
     ap.add_argument("--score", type=str, default="softmax", choices=["logit", "softmax"])
     # --- TAU-DIAGNOSTIC (dense sweep, per-input, KHONG dung ins/del de chon) ---
+    ap.add_argument("--tau_star", action="store_true",
+                    help="tau* CLOSED FORM tu pho evidence (1 backward pass, KHONG sweep). "
+                         "log tau* = sum_k |c_k| log s_k / sum_k |c_k|, c_k = <grad F, v_k><x-mu, v_k>")
     ap.add_argument("--tau_diag", action="store_true",
                     help="quet DENSE tau, log Δf/|b-x|₂/TI GIA BIEN per-input, tinh tau_rate "
                          "(rule chinh) + doi chung ORACLE(I-D). Xuat CSV long-format.")
@@ -392,6 +396,44 @@ def main():
         # (6) CSV long-format — de fit rule offline, dung suy dien tu 4 diem nua
         extra = {"id_gap": curve["_id_per_tau"]} if "_id_per_tau" in curve else None
         tau_diag.dump_curve_csv(curve, f"e1_tabular_{args.dataset}_taucurve.csv", extra_cols=extra)
+
+    # =====================================================================
+    # tau* CLOSED FORM — bo tau khoi danh sach sieu tham so.
+    #   g_k(tau) = tau/(s_k+tau) = sigmoid(log tau - log s_k)
+    #   => Δf(log tau) = tong sigmoid, moi eigen-direction mot bac thang tai log s_k
+    #   => knee (Δf''=0) = tam khoi eigenvalue mang nhieu evidence nhat
+    #   => tau* = trung binh hinh hoc co trong so cua s_k, trong so |c_k|
+    # Mot backward pass. Khong sweep, khong grid, per-input tu dong.
+    # =====================================================================
+    if args.tau_star:
+        G = grad_fn(X_eval)                                   # (M,D) grad tai chinh x
+        tstar, tdiag = taustar.tau_star(X_eval, G, ref)       # (M,)
+
+        sp = taustar.evidence_spectrum(X_eval, G, ref)
+        taustar.print_evidence_spectrum(sp, tag=f"[tabular/{args.dataset}]")
+
+        q = torch.tensor([0.25, 0.5, 0.75], device=tstar.device).double()
+        qq = torch.quantile(tstar.double(), q)
+        print(f"\n=== tau* CLOSED FORM (per-input, n={X_eval.shape[0]}) ===")
+        print(f"[i] median {qq[1]:.6g}   mean {tstar.mean():.6g}   IQR [{qq[0]:.6g}, {qq[2]:.6g}]")
+        print(f"[i] k_eff per-input: median {tdiag['k_eff'].median():.1f} / D={D}")
+        print(f"[i] sd(log s) per-input: median {tdiag['sd_log_s'].median():.3f}")
+        print(f"[i] tau_sweep hien tai = {args.tau_sweep}")
+        print("[i] So sanh tau* voi tau_sweep: neu tau* roi vao vung best cua sweep")
+        print("[i]   => tau khong con la sieu tham so, no la CLOSED FORM tu (F, x, Sigma).")
+
+        # doi chieu voi sweep (neu co --tau_diag thi dung chung curve; neu khong, quet nhanh)
+        taus_cmp = sorted(args.tau_sweep)
+        with torch.no_grad():
+            Dm = torch.zeros(X_eval.shape[0], len(taus_cmp), device=device)
+            Lm = torch.zeros(X_eval.shape[0], len(taus_cmp), device=device)
+            fx = score_target(model, X_eval, target=target, score="softmax")
+            for j, t in enumerate(taus_cmp):
+                B = shrinkage_baseline(X_eval, ref, tau=t)
+                Dm[:, j] = fx - score_target(model, B, target=target, score="softmax")
+                Lm[:, j] = (X_eval - B).norm(dim=1)
+        taustar.compare_rules(torch.tensor(taus_cmp, device=device, dtype=torch.float),
+                              Lm, Dm, tstar)
 
     # baseline strength f(x) vs f(baseline) cho moi method (None neu pool nhieu diem)
     bl_str = {nm: baseline_strength(nm) for nm in methods}

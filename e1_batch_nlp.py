@@ -53,6 +53,7 @@ from datasets import load_dataset
 
 from synthetic_e0 import fit_reference, shrinkage_baseline, fit_ppca
 import tau_diag
+import tau_star as taustar
 from soft_faith import (
     calculate_soft_sufficiency,
     calculate_soft_comprehensiveness,
@@ -97,6 +98,8 @@ def parse_args():
                     help="so token gom tu tap ref de uoc luong mu,Sigma embedding")
     ap.add_argument("--ref_sents", type=int, default=500, help="so cau quet de gom token ref")
     # --- TAU-DIAGNOSTIC ---
+    ap.add_argument("--tau_star", action="store_true",
+                    help="tau* CLOSED FORM tu pho evidence embedding (1 backward, KHONG sweep)")
     ap.add_argument("--tau_diag", action="store_true",
                     help="quet DENSE tau, log Δf/|b-x|₂/TI GIA BIEN per-cau + tau_rate (chi forward pass)")
     ap.add_argument("--diag_n", type=int, default=25)
@@ -581,6 +584,49 @@ def main():
     for m in methods:
         acc[m]["soft_gap"] = [nc + ns - 1.0
                               for nc, ns in zip(acc[m]["soft_nc"], acc[m]["soft_ns"])]
+    # =====================================================================
+    # tau* CLOSED FORM (embedding). MOT backward pass moi cau.
+    # c_k = <grad_emb F, v_k> * <emb - mu, v_k>, gop tren cac token THUONG.
+    # =====================================================================
+    if args.tau_star:
+        tstars, kes, sds = [], [], []
+        for text, _l in sample:
+            enc = tokenizer(text, truncation=True, max_length=args.max_len,
+                            return_tensors="pt").to(device)
+            we, pe, te = get_embeddings(model, args.model, enc["input_ids"], enc["attention_mask"])
+            we_g = we.clone().detach().requires_grad_(True)
+            lg = fwd(model, we_g, attention_mask=enc["attention_mask"],
+                     position_embed=pe, type_embed=te)
+            pc = int(lg.argmax(-1).item())
+            sc = F.softmax(lg, -1)[0, pc]
+            g, = torch.autograd.grad(sc, we_g)                 # (1,seq,d)
+            keep = torch.ones(enc["input_ids"].shape[1], dtype=torch.bool, device=device)
+            if not args.include_special:
+                for j, tid in enumerate(enc["input_ids"][0].tolist()):
+                    if tid in set(tokenizer.all_special_ids):
+                        keep[j] = False
+            E = we[0][keep].detach()                           # (n_tok, d)
+            Gk = g[0][keep].detach()
+            if E.shape[0] == 0:
+                continue
+            ts, td = taustar.tau_star(E, Gk, ref)              # (n_tok,)
+            # gop tren token: trung binh hinh hoc co trong so |c| tong
+            wtok = td["c"].abs().sum(1)                        # (n_tok,)
+            lt = ts.clamp_min(1e-30).log()
+            tstars.append(float((wtok * lt).sum() / wtok.sum().clamp_min(1e-30)))
+            kes.append(float(td["k_eff"].mean())); sds.append(float(td["sd_log_s"].mean()))
+        if tstars:
+            tv = torch.tensor(tstars).exp()
+            q = torch.tensor([0.25, 0.5, 0.75]).double()
+            qq = torch.quantile(tv.double(), q)
+            print(f"\n=== tau* CLOSED FORM (embedding, per-cau) n={len(tstars)} ===")
+            print(f"[i] median {qq[1]:.6g}  mean {tv.mean():.6g}  IQR [{qq[0]:.6g}, {qq[2]:.6g}]")
+            print(f"[i] k_eff median {sorted(kes)[len(kes)//2]:.1f} / d={ref.s.numel()}")
+            print(f"[i] sd(log s) median {sorted(sds)[len(sds)//2]:.3f}")
+            print(f"[i] tau_sweep hien tai = {args.tau_sweep}")
+            print("[i] Neu tau* roi vao vung best cua sweep => tau la CLOSED FORM, khong")
+            print("[i]   con la sieu tham so. Doi chieu voi bang Soft-gap ben tren.")
+
     # ---- Δf / |b-x| : DO THAY DOI DAU RA / DO THAY DOI DAU VAO ----
     # Mot TI SO, khong phai dao ham, khong phai sai phan grid.
     #

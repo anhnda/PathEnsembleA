@@ -53,6 +53,8 @@ def parse_args():
     ap.add_argument("--target", type=int, default=None, help="ep target chung; mac dinh top-1 moi anh")
     ap.add_argument("--N", type=int, default=500, help="ngan sach: so gradient eval/anh")
     # --- Shrinkage-IG (FFT Wiener low-pass), quet muc cat sigma (pixel) ---
+    ap.add_argument("--tau_star", action="store_true",
+                    help="sigma* CLOSED FORM tu pho evidence Fourier (1 backward, KHONG sweep)")
     ap.add_argument("--tau_diag", action="store_true",
                     help="quet DENSE sigma + TI GIA BIEN d(Δf)/d|b-x| per-anh -> sigma_rate (chi forward pass)")
     ap.add_argument("--diag_n", type=int, default=25)
@@ -431,7 +433,7 @@ def main():
                 target = model(x[None]).argmax(1).item()
         else:
             target = args.target
-        if getattr(args, "tau_diag", False):
+        if getattr(args, "tau_diag", False) or getattr(args, "tau_star", False):
             diag_pool.append((x.detach(), int(target)))
         grad_fn = make_resnet50_gradfn(model, target, device, chunk=args.chunk, score=args.score)
 
@@ -477,6 +479,42 @@ def main():
     win_count = {m: 0 for m in metric_names}
     for d in id_per_image:
         win_count[max(d, key=d.get)] += 1
+
+    # =====================================================================
+    # sigma* CLOSED FORM (Fourier). MOT backward pass moi anh, KHONG sweep.
+    # =====================================================================
+    if getattr(args, "tau_star", False) and diag_pool:
+        import tau_star as taustar
+        X_ts = torch.stack([p_ for p_, _ in diag_pool], 0)
+        T_ts = [t_ for _, t_ in diag_pool]
+        Gs = []
+        for i0 in range(X_ts.shape[0]):
+            xi = X_ts[i0].clone().requires_grad_(True)
+            out = model(xi[None])
+            sc = (torch.nn.functional.softmax(out, 1)[0, T_ts[i0]] if args.score == "softmax"
+                  else out[0, T_ts[i0]])
+            gi, = torch.autograd.grad(sc, xi)
+            Gs.append(gi.detach())
+        G_ts = torch.stack(Gs, 0)
+        sig_star, sdiag = taustar.sigma_star_fourier(X_ts, G_ts)
+        taustar.print_sigma_star(sig_star, sdiag, sigma_sweep=args.sigma_sweep,
+                                 tag="[vision/ResNet50]")
+
+        # doi chieu voi sweep sigma hien co
+        with torch.no_grad():
+            sw = sorted(args.sigma_sweep)
+            M_ = X_ts.shape[0]
+            Dm = torch.zeros(M_, len(sw), device=X_ts.device)
+            Lm = torch.zeros(M_, len(sw), device=X_ts.device)
+            tg = torch.tensor(T_ts, device=X_ts.device)
+            fx = torch.nn.functional.softmax(model(X_ts), 1)[torch.arange(M_), tg]
+            for j, sg in enumerate(sw):
+                B = torch.stack([spectral_reference_fft(X_ts[i], sigma=sg) for i in range(M_)], 0)
+                fb = torch.nn.functional.softmax(model(B), 1)[torch.arange(M_), tg]
+                Dm[:, j] = fx - fb
+                Lm[:, j] = (X_ts - B).reshape(M_, -1).norm(dim=1)
+        taustar.compare_rules(torch.tensor(sw, device=X_ts.device, dtype=torch.float),
+                              Lm, Dm, sig_star)
 
     print("\n" + "=" * 80)
     best_overall = _print_summary_table(metric_names, acc, id_per_image, n_img, bl_strength=bl_strength,

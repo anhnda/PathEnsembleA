@@ -90,8 +90,8 @@ def parse_args():
     ap.add_argument("--score", type=str, default="softmax", choices=["logit", "softmax"])
     # --- TAU-DIAGNOSTIC (dense sweep, per-input, KHONG dung ins/del de chon) ---
     ap.add_argument("--tau_diag", action="store_true",
-                    help="quet DENSE tau, log rho/Δf/|b-x|/SNR PER-INPUT, tinh tau_snr/tau_knee/"
-                         "tau_floor + doi chung voi ORACLE(I-D). Xuat CSV long-format.")
+                    help="quet DENSE tau, log Δf/|b-x|₂/TI GIA BIEN per-input, tinh tau_rate "
+                         "(rule chinh) + doi chung ORACLE(I-D). Xuat CSV long-format.")
     ap.add_argument("--diag_n", type=int, default=25, help="so diem tren log-grid tau (4-5 la KHONG DU)")
     ap.add_argument("--diag_lo", type=float, default=None, help="tau min (mac dinh: gamma=1e-2 * s_bar)")
     ap.add_argument("--diag_hi", type=float, default=None, help="tau max (mac dinh: gamma=1e2 * s_bar)")
@@ -99,7 +99,8 @@ def parse_args():
                     help="dung grid SCALE-FREE tau = gamma*s_bar (de so sanh duoc cross-modality)")
     ap.add_argument("--diag_oracle", action="store_true",
                     help="chay ins/del tai MOI tau tren grid de lay ORACLE tau (DAT — chi de doi chung)")
-    ap.add_argument("--diag_delta", type=float, default=0.05, help="dung sai cho tau_floor")
+    ap.add_argument("--diag_eps", type=float, default=0.01,
+                    help="nguong TUONG DOI cho ti gia bien: dung khi r(tau) < eps*max(r)")
     ap.add_argument("--n_boot", type=int, default=1000)
     ap.add_argument("--epochs", type=int, default=300)
     ap.add_argument("--hidden", type=int, default=128)
@@ -144,19 +145,26 @@ def train_classifier(Xtr, ytr, n_class, args, device):
 
 def _fmt_strength(s):
     """
-    s = dict tu fixed_baseline_diag (per-input tensors) hoac None.
-    In: f(x) f(b) ratio |b-x|2  Δf  SNR  P2%
-    Δf va SNR la CAI MOI: Δf = f(x)-f(b) la ngan sach Completeness (CO f(x) ben trong),
-    SNR = Δf/|b-x|^2 la ti so tin hieu/meo mo — day moi la dai luong xep hang.
+    s = dict tu fixed_baseline_diag hoac None.
+    In: f(x) f(b) ratio |b-x|₂ Δf |b-x|/|x-mu| amp P2%
+
+    Δf = f(x)-f(b) = NGAN SACH COMPLETENESS (co f(x) ben trong; ratio thi khong).
+    |b-x|/|x-mu| = quang duong chuan hoa: 1.0 = da toi mu, >1 = di QUA mu.
+    amp = bien do con lai so voi san 1/K.
+
+    (BO cot SNR = Δf/|b-x|² — da chung minh HONG: o vision D=150k thi mau so ~1e4,
+     tu so <=1, in ra toan 0.0000; va moi baseline manh deu cham tran Δf nen tu so
+     thanh hang so => SNR thoai hoa thanh 1/|b-x|². Thay bang TI GIA BIEN o bang
+     tau-diagnostic.)
     """
     if s is None:
-        return f"{'-':>8}{'-':>8}{'-':>8}{'-':>9}{'-':>9}{'-':>9}{'-':>6}"
-    fx = s["f_x"].mean().item(); fb = s["f_b"].mean().item()
-    r = s["rho"].mean().item(); d = s["dist"].mean().item()
-    df = s["delta_f"].mean().item(); sn = s["snr"].mean().item()
+        return f"{'-':>8}{'-':>8}{'-':>8}{'-':>9}{'-':>9}{'-':>8}{'-':>7}{'-':>6}"
+    g = lambda k: (s[k].mean().item() if k in s else float("nan"))
+    f = lambda v, w, p=4: (f"{v:>{w}.{p}f}" if v == v else f"{'-':>{w}}")
     p2 = s["P2_ok"].mean().item() * 100 if "P2_ok" in s else float("nan")
     p2s = f"{p2:>5.0f}%" if p2 == p2 else f"{'-':>6}"
-    return f"{fx:>8.4f}{fb:>8.4f}{r:>8.4f}{d:>9.4f}{df:>9.4f}{sn:>9.3f}{p2s}"
+    return (f(g("f_x"),8) + f(g("f_b"),8) + f(g("rho"),8) + f(g("dist"),9)
+            + f(g("delta_f"),9) + f(g("dist_norm"),8,3) + f(g("amp"),7,3) + p2s)
 
 
 def main():
@@ -283,7 +291,7 @@ def main():
             dist  = ||b-x||_2   (SUA: truoc day la (b-x).abs().mean() = L1/D,
                                  KHONG phai quang duong Euclid, dung cho SNR la sai)
             dist2 = ||b-x||_2^2 <- meo mo IG ~ O(L * dist2), khong phu thuoc f(x)
-            snr   = delta_f / dist2
+            dist_norm = |b-x|/|x-mu|   (1.0 = da toi mu, >1 = di QUA mu)
             maha_b, P2_ok       <- kiem tra (P2) contraction cho tung baseline
         """
         if baseline_vec_for(name, X_eval[0]) is None:
@@ -292,7 +300,7 @@ def main():
             X_eval,
             lambda Z: score_target(model, Z, target=target, score="softmax"),
             lambda x: baseline_vec_for(name, x),
-            ref_s=ref.s, ref_V=ref.V, ref_mu=ref.mu,
+            mu=mu, ref_s=ref.s, ref_V=ref.V, ref_mu=ref.mu, n_class=n_class,
         )
 
     methods = ["IG-zero", "IG-mean", "IG-median", "IG-random"]
@@ -322,7 +330,7 @@ def main():
         print(f"[i] D = {D},  participation ratio PR = {PR:.2f}  ({PR/D*100:.1f}% cua D)")
         print(f"[i] s_bar (mean eigval) = {s_bar:.6g}   s_max = {ref.s.max():.6g}  s_min = {ref.s.min():.6g}")
         if PR < 0.2 * D:
-            print("[i] PR NHO => pho tap trung => rho(tau) co knee SAC => tau_snr nen xac dinh ro.")
+            print("[i] PR NHO => pho tap trung => duong cong doc, gay SAC => tau_rate on dinh.")
         else:
             print("[!] PR LON => pho trai dai => knee MO => moi rule chon tau se BAT DINH.")
             print("[!] Dung ky vong rule sac net o modality nay (vd anh tu nhien, pho 1/f^2).")
@@ -342,6 +350,7 @@ def main():
             X_eval, score_fn,
             lambda x, t: shrinkage_baseline(x, ref, tau=t),
             taus_d, mu=mu, ref_s=ref.s, ref_V=ref.V, ref_mu=ref.mu,
+            n_class=n_class,
         )
         tau_diag.print_curve_table(curve, tag=f"[tabular/{args.dataset}]")
 
@@ -375,14 +384,8 @@ def main():
             curve["_id_per_tau"] = id_per_tau
 
         # (5) Selection rules — deu CHI dung forward pass
-        rules, valid_m = tau_diag.selection_rules(curve, delta=args.diag_delta)
+        rules, valid_m = tau_diag.selection_rules(curve, eps=args.diag_eps)
         tau_diag.print_rules_table(rules, oracle=oracle, valid=valid_m)
-        print("[i] tau_snr   = argmax Δf/|b-x|² — ung vien CHINH (co f(x) ben trong).")
-        print("[i] tau_knee  = Kneedle tren (log tau, log rho).")
-        print("[i] tau_floor = tau nho nhat cham san rho_floor+δ. CANH BAO: tren vision rule nay")
-        print("[i]             chon @8/@16, deu THUA @4 => chua phai rule dung. Giu de doi chung.")
-        if oracle is not None:
-            print("[i] Neu tau_snr ~ ORACLE => chon duoc tau MA KHONG cham test metric. Do la ket qua.")
 
         # (6) CSV long-format — de fit rule offline, dung suy dien tu 4 diem nua
         extra = {"id_gap": curve["_id_per_tau"]} if "_id_per_tau" in curve else None
@@ -394,7 +397,7 @@ def main():
     table, gaps_by_method = {}, {}
     if args.metric == "soft":
         print(f"{'method':<20}{'Soft-NC↑':>12}{'Soft-NS↑':>12}{'Soft-gap↑':>12}"
-              f"{'f(x)':>8}{'f(b)':>8}{'ratio':>8}{'|b-x|₂':>9}{'Δf':>9}{'SNR':>9}{'P2':>6}"
+              f"{'f(x)':>8}{'f(b)':>8}{'ratio':>8}{'|b-x|₂':>9}{'Δf':>9}{'|b-x|/|x-μ|':>8}{'amp':>7}{'P2':>6}"
               f"{'  (gap±SE)'}")
         print("-" * 118)
         for nm in methods:
@@ -417,7 +420,7 @@ def main():
                   f"{table[nm]['id_gap']:>12.4f}{scol}   ± {se:.4f}")
     else:
         print(f"{'method':<20}{'insertion↑':>12}{'deletion↓':>12}{'I-D↑':>10}"
-              f"{'f(x)':>8}{'f(b)':>8}{'ratio':>8}{'|b-x|₂':>9}{'Δf':>9}{'SNR':>9}{'P2':>6}"
+              f"{'f(x)':>8}{'f(b)':>8}{'ratio':>8}{'|b-x|₂':>9}{'Δf':>9}{'|b-x|/|x-μ|':>8}{'amp':>7}{'P2':>6}"
               f"{'  (mean±SE[±seed-std])'}")
         print("-" * 122)
         idg = torch.Generator(device="cpu"); idg.manual_seed(args.seed + 7)   # boc marginal
@@ -461,12 +464,10 @@ def main():
           f"   <-- best")
     if bl_str.get(best) is not None:
         s = bl_str[best]
-        print(f"[i] baseline strength cua best: f(x)={s['f_x'].mean():.4f} f(b)={s['f_b'].mean():.4f} "
-              f"ratio={s['rho'].mean():.4f} |b-x|₂={s['dist'].mean():.4f} "
-              f"Δf={s['delta_f'].mean():.4f} SNR={s['snr'].mean():.3f}")
-    print("[i] ratio~1 => baseline chua xoa gi; ratio thap => trung tinh/lat lop (vd IG-zero OOD).")
-    print("[i] Δf = f(x)-f(b) = ngan sach Completeness (sum phi_i). SNR = Δf/|b-x|₂².")
-    print("[i] Xep hang theo SNR, KHONG theo ratio: ratio bo mat f(x), ma f(x) khac nhau moi input.")
+        print(f"[i] best: f(x)={s['f_x'].mean():.4f} f(b)={s['f_b'].mean():.4f} "
+              f"Δf={s['delta_f'].mean():.4f} |b-x|₂={s['dist'].mean():.4f}")
+    print("[i] Δf = f(x)-f(b) = ngan sach Completeness (= sum phi_i, Completeness).")
+    print("[i] Chay --tau_diag de co TI GIA BIEN d(Δf)/d|b-x| va tau_rate (rule chon tau).")
 
     # ---- Paired test: Shrinkage-IG(gap tot nhat) vs baseline (ghep cap per-sample) ----
     shr = [m for m in methods if m.startswith("Shrinkage-IG")]

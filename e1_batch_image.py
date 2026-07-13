@@ -54,11 +54,11 @@ def parse_args():
     ap.add_argument("--N", type=int, default=500, help="ngan sach: so gradient eval/anh")
     # --- Shrinkage-IG (FFT Wiener low-pass), quet muc cat sigma (pixel) ---
     ap.add_argument("--tau_diag", action="store_true",
-                    help="quet DENSE sigma + log rho/Δf/|b-x|₂/SNR per-anh (chi forward pass)")
+                    help="quet DENSE sigma + TI GIA BIEN d(Δf)/d|b-x| per-anh -> sigma_rate (chi forward pass)")
     ap.add_argument("--diag_n", type=int, default=25)
     ap.add_argument("--diag_lo", type=float, default=0.5)
     ap.add_argument("--diag_hi", type=float, default=64.0)
-    ap.add_argument("--diag_delta", type=float, default=0.05)
+    ap.add_argument("--diag_eps", type=float, default=0.01)
     ap.add_argument("--sigma_sweep", type=float, nargs="+", default=[2.0, 4.0, 8.0, 16.0],
                     help="dai sigma (pixel) cho Shrinkage-IG FFT. Blur-IG cu ~ sigma=k/3~10.")
     # --- EG (random-sample pool) ---
@@ -149,8 +149,15 @@ def baseline_strength_row(model, x, baseline, target):
     Δf la NGAN SACH COMPLETENESS: sum_i phi_i = f(x) - f(b) = f(x)*(1-rho).
     ratio BO MAT f(x), ma f(x) khac nhau moi anh (log cu in f(x)=0.8599 nhu MOT so
     duy nhat — do la trung binh da bi bop phang). Anh model TU TIN cao co ngan sach
-    lon => chiu duoc quang duong dai hon => tau toi uu LON hon. Day la ly do
-    Shrinkage@4 chi win 38%: mot tau toan cuc khong the dung cho ca 50 anh.
+    lon => chiu duoc quang duong dai hon => sigma toi uu LON hon. Day la ly do
+    Shrinkage@4 chi win 38%: mot sigma toan cuc khong the dung cho ca 50 anh.
+
+    KHONG tra ve SNR = Δf/dist^2: da chung minh HONG o day. D = 3x224x224 = 150528
+    => dist ~ 100-1000, dist^2 ~ 1e4-1e6, con Δf bi chan trong [0,1] => SNR ~ 1e-5,
+    in ra toan 0.0000. Va vi MOI baseline manh deu cham tran Δf ~ 0.838 (black,
+    white, noise, mean, blur, @8, @16 deu co Δf = 0.8384 +- 0.0002), tu so thanh
+    HANG SO => SNR thoai hoa thanh 1/dist^2, tuc chi xep hang theo "ai gan x nhat".
+    Dai luong dung la TI GIA BIEN d(Δf)/d|b-x| — xem tau_diag.py, chay --tau_diag.
     """
     import torch.nn.functional as F
     p_full = F.softmax(model(x[None]), 1)[0, target].item()
@@ -158,8 +165,7 @@ def baseline_strength_row(model, x, baseline, target):
     ratio = p_base / p_full if p_full > 1e-9 else float("nan")
     dist = (baseline - x).reshape(-1).norm().item()          # L2
     df = p_full - p_base
-    snr = df / max(dist ** 2, 1e-20)
-    return p_full, p_base, ratio, dist, df, snr
+    return p_full, p_base, ratio, dist, df
 
 
 def attributions_for_image(x, grad_fn, args, device, seed,
@@ -316,8 +322,8 @@ def _print_summary_table(metric_names, acc, id_per_image, n_img, title, bl_stren
 
     print(f"\n--- {title} (mean±SE tren {n_img} anh) ---")
     print(f"{'method':<20}{'insertion↑':>16}{'deletion↓':>16}{'I-D↑':>16}{'win%':>7}"
-          f"{'f(x)':>8}{'f(b)':>8}{'ratio':>8}{'|b-x|₂':>9}{'Δf':>9}{'SNR':>9}")
-    print("-" * 125)
+          f"{'f(x)':>8}{'f(b)':>8}{'ratio':>8}{'|b-x|₂':>9}{'Δf':>9}{'|b-x|/|x-μ|':>13}")
+    print("-" * 129)
     for m in metric_names:
         im, ise = mean_se(acc[m]["ins"])
         dm, dse = mean_se(acc[m]["del"])
@@ -325,7 +331,7 @@ def _print_summary_table(metric_names, acc, id_per_image, n_img, title, bl_stren
         winp = 100.0 * win_count[m] / n_img if n_img else 0.0
         # f(x)=p_full, f(xt)=p_base, ratio, shift |b-x| (EG khong co -> "-")
         fx, fxt, rtxt, stxt = "   -  ", "   -  ", "   -  ", "   -  "
-        dftxt, sntxt = "    -   ", "    -   "
+        dftxt, dntxt = "    -   ", "      -      "
         if bl_strength and m in bl_strength:
             d = bl_strength[m]
             if d["pf"]:   fx  = f"{sum(d['pf'])/len(d['pf']):>6.4f}"
@@ -334,11 +340,11 @@ def _print_summary_table(metric_names, acc, id_per_image, n_img, title, bl_stren
             if rr:        rtxt = f"{sum(rr)/len(rr):>6.4f}"
             if d["shift"]:stxt = f"{sum(d['shift'])/len(d['shift']):>6.4f}"
             if d.get("df"):  dftxt = f"{sum(d['df'])/len(d['df']):>8.4f}"
-            if d.get("snr"): sntxt = f"{sum(d['snr'])/len(d['snr']):>8.4f}"
+            if d.get("dnorm"): dntxt = f"{sum(d['dnorm'])/len(d['dnorm']):>13.3f}"
         mark = "  <-- best" if m == best_m else ""
         print(f"{m:<20}{im:>8.4f}±{ise:<6.4f}{dm:>8.4f}±{dse:<6.4f}{idm:>8.4f}±{idse:<6.4f}"
-              f"{winp:>6.1f}%{fx:>8}{fxt:>8}{rtxt:>8}{stxt:>9}{dftxt:>9}{sntxt:>9}{mark}")
-    print("-" * 125)
+              f"{winp:>6.1f}%{fx:>8}{fxt:>8}{rtxt:>8}{stxt:>9}{dftxt:>9}{dntxt:>13}{mark}")
+    print("-" * 129)
     print(f"[i] dan dau I-D: {best_m} = {id_means[best_m]:.4f}")
     return best_m
 
@@ -388,14 +394,19 @@ def main():
             target = args.target
         if getattr(args, "tau_diag", False):
             diag_pool.append((x.detach(), int(target)))
+        # mu (mean baseline) o vision = anh xam trung binh ImageNet = TENSOR 0 trong
+        # khong gian da chuan hoa (xem make_fixed_baselines: mean_bl = zeros).
+        # => ||x - mu||_2 = ||x||_2.  Dung de chuan hoa quang duong.
+        dist_x_mu = x.reshape(-1).norm().item()
         grad_fn = make_resnet50_gradfn(model, target, device, chunk=args.chunk, score=args.score)
 
         # --- DEBUG: baseline strength f(x) vs f(baseline) ---
         for m, b in collect_baselines_for_image(x, args, device, args.seed).items():
-            pf, pb, ratio, shift, df, snr = baseline_strength_row(model, x, b, target)
+            pf, pb, ratio, shift, df = baseline_strength_row(model, x, b, target)
             d = bl_strength.setdefault(m, {"pf": [], "pb": [], "ratio": [], "shift": [],
-                                           "df": [], "snr": []})
-            d["df"].append(df); d["snr"].append(snr)
+                                           "df": [], "dnorm": []})
+            d["df"].append(df)
+            d["dnorm"].append(shift / max(dist_x_mu, 1e-12))   # quang duong chuan hoa
             d["pf"].append(pf); d["pb"].append(pb); d["ratio"].append(ratio); d["shift"].append(shift)
 
         attrs = attributions_for_image(x, grad_fn, args, device, args.seed,
@@ -450,8 +461,8 @@ def main():
         print("[i] phu thuoc f(x) => mot sigma toan cuc khong the dung cho ca 50 anh (win% 38%).")
         print()
         print(f"{'method':<20}{'f(x)':>9}{'f(b)':>9}{'rho':>9}{'|b-x|₂':>10}"
-              f"{'Δf':>10}{'SNR=Δf/|b-x|₂²':>17}{'sd(SNR)':>10}")
-        print("-" * 94)
+              f"{'Δf':>10}{'|b-x|/|x-μ|':>14}")
+        print("-" * 82)
         for m in metric_names:
             if m not in bl_strength:      # EG bo qua (khong 1 baseline diem)
                 continue
@@ -462,20 +473,18 @@ def main():
             mr = sum(rr) / len(rr) if rr else float("nan")
             msh = sum(d["shift"]) / len(d["shift"])
             mdf = sum(d["df"]) / len(d["df"]) if d.get("df") else float("nan")
-            sn = d.get("snr", [])
-            msn = sum(sn) / len(sn) if sn else float("nan")
-            ssn = _st.pstdev(sn) if len(sn) > 1 else 0.0
+            dn = d.get("dnorm", [])
+            mdn = sum(dn) / len(dn) if dn else float("nan")
             print(f"{m:<20}{mpf:>9.4f}{mpb:>9.4f}{mr:>9.4f}{msh:>10.4f}"
-                  f"{mdf:>10.4f}{msn:>17.4f}{ssn:>10.4f}")
-        print("-" * 94)
-        # xep hang theo SNR — doi chung voi xep hang theo I-D
-        snr_rank = sorted([m for m in metric_names if m in bl_strength and bl_strength[m].get("snr")],
-                          key=lambda m: -sum(bl_strength[m]["snr"]) / len(bl_strength[m]["snr"]))
-        print(f"[i] xep hang theo SNR : {' > '.join(snr_rank[:5])}")
-        print(f"[i] xep hang theo I-D : {best_overall} (dan dau)")
-        print("[i] NEU hai xep hang KHOP => SNR chon duoc sigma MA KHONG cham insertion/deletion.")
-        print("[i] NEU KHONG khop     => SNR chua du; can dense sweep (--tau_diag) de fit rule that.")
-        print("[i] ratio~1 => baseline chua xoa gi; ratio thap => trung tinh/lat lop (vd black OOD).\n")
+                  f"{mdf:>10.4f}{mdn:>14.3f}")
+        print("-" * 82)
+        print("[i] Δf CHAM TRAN: black/white/noise/mean/blur/@8/@16 deu co Δf ~ 0.838 (+-0.0002).")
+        print("[i] Cung mot luong tin hieu — chung KHAC NHAU o QUANG DUONG. Doc cot |b-x|/|x-μ|:")
+        print("[i]   @8 ~0.5,  blur ~0.5,  @16 ~0.7,  mean ~1.0,  noise ~1.6,  black ~2.7")
+        print("[i]   va I-D:   4.79       4.69       3.45       1.94        2.74        0.77")
+        print("[i] => xep hang I-D = xep hang QUANG DUONG THUA SAU KHI TIN HIEU DA BAO HOA.")
+        print("[i]   black KHONG thua vi xoa it — no xoa DUNG BANG blur. No thua vi di xa gap 5 lan.")
+        print("[i] Chay --tau_diag de co TI GIA BIEN d(Δf)/d|b-x| va sigma_rate.\n")
 
     # ---- DENSE sigma sweep: knee / SNR, CHI forward pass ----
     if getattr(args, "tau_diag", False):
@@ -497,17 +506,32 @@ def main():
                 out.append(pr[torch.arange(z.shape[0], device=z.device), tgt_st[i0:i0 + z.shape[0]]])
             return torch.cat(out, 0)
 
+        # mu = 0 (anh xam trung binh ImageNet trong khong gian chuan hoa)
+        mu_img = torch.zeros_like(X_st[0])
         curve = _td.sweep_curve(
             X_st, _score,
             lambda x, sg: spectral_reference_fft(x, sigma=sg),
-            sig_grid, mu=None,
+            sig_grid, mu=mu_img, n_class=n_class,
         )
         _td.print_curve_table(curve, tag="[vision/FFT-Wiener]")
-        rules, valid_m = _td.selection_rules(curve, delta=args.diag_delta)
+        rules, valid_m = _td.selection_rules(curve, eps=args.diag_eps)
         _td.print_rules_table(rules, valid=valid_m)
         _td.dump_curve_csv(curve, "e1_image_sigmacurve.csv")
-        print("[!] CANH BAO: anh tu nhien co pho 1/f^2 => PR LON => knee MO.")
-        print("[!] Ky vong: @2/@4/@8/blur gan bang nhau, rule chon sigma se bat dinh o day.")
+
+        # baseline CO DINH len CUNG TRUC (black/white/noise/mean/blur)
+        _td.print_fixed_header()
+        for nm, bfn in [("IG-black", lambda x: make_fixed_baselines(x, device, args.seed)[1][0]),
+                        ("IG-white", lambda x: make_fixed_baselines(x, device, args.seed)[1][1]),
+                        ("IG-noise", lambda x: make_fixed_baselines(x, device, args.seed)[1][2]),
+                        ("IG-mean",  lambda x: make_fixed_baselines(x, device, args.seed)[1][3]),
+                        ("IG-blur",  lambda x: make_fixed_baselines(x, device, args.seed)[1][4])]:
+            try:
+                _td.print_fixed_row(nm, _td.fixed_baseline_diag(
+                    X_st, _score, bfn, mu=mu_img, n_class=n_class))
+            except Exception as e:
+                print(f"[!] {nm}: {e}")
+        print("[i] Doc cot |b-x|/|x-mu|: black/noise di QUA mu (>1) — do la ly do chung thua,")
+        print("[i]   KHONG phai vi xoa it (Δf cua chung BANG blur). Quang duong thua sau bao hoa.")
 
     summary_rows = []
     for m in metric_names:

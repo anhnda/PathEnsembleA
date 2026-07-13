@@ -257,67 +257,116 @@ def print_evidence_spectrum(sp, tag=""):
 # TAN SO, khong phai phuong sai. Phai noi ro trong paper la hai dai luong khac nhau.
 
 
-def sigma_star_fourier(x, grad_x, eps=1e-12):
+def sigma_star_fourier(x, grad_x, eps=1e-12, frac=0.5, n_bisect=40):
     """
-    x, grad_x : (C,H,W) hoac (M,C,H,W)   — anh da chuan hoa va grad_x F(x)
+    x, grad_x : (C,H,W) hoac (M,C,H,W)   — anh chuan hoa va grad_x F(x)
+    Tra ve (sigma*, dict). sigma theo PIXEL, khop spectral_reference_fft.
 
-    Tra ve (sigma*, dict). sigma tinh theo PIXEL, khop voi spectral_reference_fft.
+    =====================================================================
+    BAN CU SAI 3 CHO — sigma* = 1.74 trong khi best = @4 (lech 2.3x):
 
-    c(w) = |X(w)| * |G(w)|   (do lon Fourier coeff cua x va cua grad)
-         = evidence ma model doc o tan so w
-    log w_ev = sum |c| log|w| / sum |c|      (trung binh hinh hoc tan so)
-    sigma*   = sqrt(2 ln 2) / w_ev           (cat tai giua khoi evidence)
+    (1) TRONG SO SAI DAU.  Dung c(w) = |X(w)| * |G(w)| (do lon), bo PHA.
+        Dong gop THAT cua tan so w vao f(x) la phan THUC cua tich vo huong:
+            c(w) = Re[ conj(G(w)) * X(w) ]
+        Do moi la <grad F, e_w><x, e_w>, khop cong thuc c_k = g~_k * d~_k o
+        phan tabular. |X||G| la CAN TREN cua no, va can tren thi LUON DUONG o
+        moi tan so => trai deu GIA TAO (k_eff = 5863/25k = 23% toan pho).
+
+    (2) BIAS DEM-VANH.  So tan so tren vanh ban kinh w TI LE VOI w (dien tich
+        vanh ~ 2*pi*w*dw). Nen sum_w bi chi phoi boi tan so CAO thuan tuy do
+        DEM, khong phai do evidence. Trung binh hinh hoc bi keo len
+        => w_ev qua lon => sigma* qua NHO. Dung huong lech quan sat duoc.
+
+    (3) DINH NGHIA SAI.  "Cat tai TAM pho evidence" khong phai dieu ta muon.
+        Cai quyet dinh la baseline XOA duoc bao nhieu evidence, tuc residual
+            r(w) = 1 - exp(-0.5 * sigma^2 * w^2)
+        Nen dat sigma* sao cho TONG EVIDENCE BI XOA = frac * tong evidence:
+
+            sum_w c(w) * (1 - exp(-0.5 sigma^2 w^2))  =  frac * sum_w c(w)
+
+        Don dieu tang theo sigma => nghiem DUY NHAT, bisection.
+        Khong can trung binh hinh hoc, khong dinh bias dem-vanh (vi c(w) xuat
+        hien o CA hai ve, ti le bi triet).
+    =====================================================================
+
+    frac = 0.5 : xoa mot NUA evidence. La lua chon co the tranh cai — nhung no
+    la MOT tham so duy nhat, va co y nghia (diem giua), khac han viec sweep sigma.
     """
     single = (x.dim() == 3)
-    X = x[None] if single else x                        # (M,C,H,W)
+    X = x[None] if single else x
     G = grad_x[None] if single else grad_x
     M, C, H, W = X.shape
 
-    Xf = torch.fft.rfft2(X, dim=(-2, -1))               # (M,C,H,W//2+1)
+    Xf = torch.fft.rfft2(X, dim=(-2, -1))               # (M,C,H,Wr) phuc
     Gf = torch.fft.rfft2(G, dim=(-2, -1))
+
+    # (1) evidence CO DAU: Re[ conj(G) * X ], gop kenh mau
+    c = (Gf.conj() * Xf).real.sum(1)                    # (M,H,Wr)
+
     fy = torch.fft.fftfreq(H, device=X.device).view(H, 1)
     fx = torch.fft.rfftfreq(W, device=X.device).view(1, -1)
-    w = (2 * math.pi) * (fy ** 2 + fx ** 2).sqrt()      # |omega| rad/pixel, (H,W//2+1)
+    w = (2 * math.pi) * (fy ** 2 + fx ** 2).sqrt()      # |omega| rad/px, (H,Wr)
 
-    c = (Xf.abs() * Gf.abs()).sum(1)                    # (M,H,W//2+1) gop kenh mau
-    mask = w > eps                                      # bo DC (log 0)
-    cw = c[:, mask]                                     # (M,K)
-    lw = w[mask].log()[None]                            # (1,K)
+    mask = w > eps                                      # bo DC
+    cw = c[:, mask]                                     # (M,K) CO DAU
+    ww = w[mask][None]                                  # (1,K)
 
-    Z = cw.sum(1, keepdim=True).clamp_min(1e-30)
-    log_w_ev = (cw * lw).sum(1, keepdim=True) / Z       # (M,1)
-    w_ev = log_w_ev.exp().squeeze(1)                    # (M,)
-    sig = math.sqrt(2 * math.log(2)) / w_ev.clamp_min(eps)
+    # dung |c| lam trong so (huong nao model DUNG, khong quan tam chieu)
+    a = cw.abs()
+    Z = a.sum(1, keepdim=True).clamp_min(1e-30)         # (M,1) tong evidence
 
-    p = cw / Z
+    # (3) bisection tren log sigma: tim sigma sao cho evidence bi xoa = frac * Z
+    lo = torch.full((M, 1), math.log(1e-3), device=X.device)
+    hi = torch.full((M, 1), math.log(1e3), device=X.device)
+    for _ in range(n_bisect):
+        mid = 0.5 * (lo + hi)
+        sg = mid.exp()                                  # (M,1)
+        removed = (a * (1.0 - torch.exp(-0.5 * sg.pow(2) * ww.pow(2)))).sum(1, keepdim=True)
+        too_much = removed > frac * Z                   # xoa qua nhieu -> giam sigma
+        hi = torch.where(too_much, mid, hi)
+        lo = torch.where(too_much, lo, mid)
+    sig = (0.5 * (lo + hi)).exp().squeeze(1)            # (M,)
+
+    # --- chan doan ---
+    p = a / Z
+    lw = ww.clamp_min(eps).log()
     m1 = (p * lw).sum(1)
     sd = ((p * lw.pow(2)).sum(1) - m1.pow(2)).clamp_min(0).sqrt()
     ent = -(p.clamp_min(1e-30) * p.clamp_min(1e-30).log()).sum(1)
+    # bao nhieu % evidence nam trong 10% tan so manh nhat?
+    K = a.shape[1]
+    top = max(1, int(0.1 * K))
+    frac_top = a.sort(1, descending=True).values[:, :top].sum(1) / Z.squeeze(1)
+    # ti le evidence DUONG (neu ~0.5 thi c(w) doi dau lung tung -> tin hieu yeu)
+    pos = (cw > 0).float().mean(1)
 
-    diag = {"w_ev": w_ev if not single else w_ev[0],
+    diag = {"w_ev": m1.exp() if not single else m1.exp()[0],
             "sd_log_w": sd if not single else sd[0],
-            "k_eff": ent.exp() if not single else ent.exp()[0]}
+            "k_eff": ent.exp() if not single else ent.exp()[0],
+            "frac_top10": frac_top if not single else frac_top[0],
+            "frac_pos": pos if not single else pos[0]}
     return (sig[0] if single else sig), diag
 
 
-def print_sigma_star(sig, diag, sigma_sweep=None, tag=""):
+def print_sigma_star(sig, diag, sigma_sweep=None, tag="", frac=0.5):
     M = sig.numel()
     q = torch.tensor([0.25, 0.5, 0.75]).double()
     qq = torch.quantile(sig.double().cpu(), q)
     print(f"\n=== sigma* CLOSED FORM (Fourier) {tag}  n={M} ===")
     print(f"[i] median {qq[1]:.4f}  mean {sig.mean():.4f}  IQR [{qq[0]:.4f}, {qq[2]:.4f}]  (pixel)")
-    print(f"[i] w_ev (tan so evidence): median {diag['w_ev'].median():.5f} rad/pixel")
-    print(f"[i] sd(log w) = {diag['sd_log_w'].median():.3f}  <- do TRAI cua khoi evidence")
-    print(f"[i] k_eff = {diag['k_eff'].median():.0f} tan so hieu dung")
+    print(f"[i] dinh nghia: sigma sao cho XOA {frac*100:.0f}% tong evidence")
+    print(f"[i]   sum_w |c(w)| (1 - exp(-0.5 σ²ω²)) = {frac:.2f} * sum_w |c(w)|")
+    print(f"[i]   c(w) = Re[conj(G(w)) X(w)]  <- CO DAU (ban cu dung |X||G|, SAI)")
+    print(f"[i] w_ev {diag['w_ev'].median():.5f} rad/px   k_eff {diag['k_eff'].median():.0f}"
+          f"   sd(log w) {diag['sd_log_w'].median():.3f}")
+    print(f"[i] top-10% tan so giu {diag['frac_top10'].median()*100:.1f}% evidence")
+    print(f"[i] ti le c(w) > 0: {diag['frac_pos'].median()*100:.1f}%"
+          f"   (~50% => c doi dau lung tung => tin hieu YEU)")
     if sigma_sweep:
-        print(f"[i] sigma_sweep hien tai = {sigma_sweep}")
-    print("[!] LUU Y: vision dung GAUSSIAN BLUR (gain = exp(-0.5 sigma^2 w^2)), KHONG phai")
-    print("[!]   shrinkage gain tau/(s+tau). Nen sigma* dung cong thuc KHAC: cat tai tan so")
-    print("[!]   evidence, khong phai tai phuong sai evidence. Hai dai luong KHAC NHAU —")
-    print("[!]   chung chi trung khi Sigma stationary (Cor.2 draft), do la GIA DINH.")
-    if diag["sd_log_w"].median() > 1.5:
-        print("[!!] sd(log w) LON => evidence TRAI DEU tren nhieu bac tan so (pho 1/f^2).")
-        print("[!!]  Trung binh co trong so = tam cua phan bo PHANG => sigma* kem tin cay.")
+        print(f"[i] sigma_sweep = {sigma_sweep}")
+    if diag["frac_top10"].median() < 0.5:
+        print("[!!] top-10% tan so giu < 50% evidence => evidence TRAI DEU.")
+        print("[!!]  Moi rule dua tren 'tam khoi evidence' se kem tin cay o vision.")
 
 
 # ---------------------------------------------------------------------------

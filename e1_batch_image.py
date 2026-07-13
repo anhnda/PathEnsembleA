@@ -54,7 +54,10 @@ def parse_args():
     ap.add_argument("--N", type=int, default=500, help="ngan sach: so gradient eval/anh")
     # --- Shrinkage-IG (FFT Wiener low-pass), quet muc cat sigma (pixel) ---
     ap.add_argument("--tau_star", action="store_true",
-                    help="sigma* CLOSED FORM tu pho evidence Fourier (1 backward, KHONG sweep)")
+                    help="sigma* CLOSED FORM: sigma sao cho XOA frac% tong evidence Fourier "
+                         "(1 backward/anh, KHONG sweep)")
+    ap.add_argument("--star_frac", type=float, default=0.5,
+                    help="ti le evidence bi xoa tai sigma* (mac dinh 0.5 = mot nua)")
     ap.add_argument("--tau_diag", action="store_true",
                     help="quet DENSE sigma + TI GIA BIEN d(Δf)/d|b-x| per-anh -> sigma_rate (chi forward pass)")
     ap.add_argument("--diag_n", type=int, default=25)
@@ -315,7 +318,8 @@ def wilcoxon(a, b):
 
 
 def _print_summary_table(metric_names, acc, id_per_image, n_img, title, bl_strength=None,
-                         sigma_sweep=None, eps=0.05, sigstar=None, sigstar_diag=None):
+                         sigma_sweep=None, eps=0.05, sigstar=None, sigstar_diag=None,
+                         star_frac=0.5):
     win_count = {m: 0 for m in metric_names}
     for d in id_per_image:
         win_count[max(d, key=d.get)] += 1
@@ -401,45 +405,30 @@ def _print_summary_table(metric_names, acc, id_per_image, n_img, title, bl_stren
     print("[i]   khong can D, khong phu thuoc grid, khong bao gio am.")
     # ---- sigma* CLOSED FORM (in NGAY, khong doi het 50 anh) ----
     if sigstar:
-        import statistics as _st
-        ss = sorted(sigstar)
-        n_ = len(ss)
-        med = ss[n_ // 2]
-        q1, q3 = ss[n_ // 4], ss[(3 * n_) // 4]
+        ss = sorted(sigstar); n_ = len(ss)
+        med = ss[n_ // 2]; q1, q3 = ss[n_ // 4], ss[(3 * n_) // 4]
+        _md = lambda k: (sorted(sigstar_diag[k])[len(sigstar_diag[k]) // 2]
+                         if sigstar_diag and sigstar_diag.get(k) else float("nan"))
         print(f"\n[sigma*] CLOSED FORM (Fourier, 1 backward/anh, KHONG sweep)  n={n_}")
+        print(f"[i]   dinh nghia: sigma sao cho XOA {star_frac*100:.0f}% tong evidence")
+        print(f"[i]     sum_w |c(w)| (1 - exp(-0.5 σ²ω²)) = {star_frac:.2f} * sum_w |c(w)|")
+        print(f"[i]     c(w) = Re[conj(G(w)) X(w)]  <- CO DAU")
         print(f"[i]   median {med:.3f}  mean {sum(ss)/n_:.3f}  IQR [{q1:.3f}, {q3:.3f}]  (pixel)")
-        if sigstar_diag and sigstar_diag.get("sd_log_w"):
-            sdw = sorted(sigstar_diag["sd_log_w"])[len(sigstar_diag["sd_log_w"]) // 2]
-            kef = sorted(sigstar_diag["k_eff"])[len(sigstar_diag["k_eff"]) // 2]
-            wev = sorted(sigstar_diag["w_ev"])[len(sigstar_diag["w_ev"]) // 2]
-            print(f"[i]   w_ev median {wev:.5f} rad/px   k_eff {kef:.0f}   sd(log w) {sdw:.3f}")
-            if sdw > 1.5:
-                print(f"[!!]  sd(log w) = {sdw:.2f} LON => evidence TRAI DEU tren nhieu bac tan so")
-                print(f"[!!]   (pho anh 1/f^2). Trung binh co trong so = tam phan bo PHANG")
-                print(f"[!!]   => sigma* KEM TIN CAY o vision. Noi ro han che nay.")
+        print(f"[i]   w_ev {_md('w_ev'):.5f} rad/px   k_eff {_md('k_eff'):.0f}"
+              f"   sd(log w) {_md('sd_log_w'):.3f}")
+        print(f"[i]   top-10% tan so giu {_md('frac_top10')*100:.1f}% evidence")
+        print(f"[i]   ti le c(w)>0: {_md('frac_pos')*100:.1f}%  (~50% => c doi dau => tin hieu YEU)")
         if sigma_sweep:
             near = min(sigma_sweep, key=lambda sg: abs(math.log(max(sg, 1e-9)) - math.log(max(med, 1e-9))))
             hit = f"Shrinkage-IG@{near:g}"
-            agree2 = "KHOP" if hit == best_m else "LECH"
-            print(f"[i]   sigma* median {med:.3f} -> gan nhat tren sweep: {hit}   [{agree2} voi best I-D]")
+            print(f"[i]   sigma* {med:.3f} -> gan nhat tren sweep: {hit}"
+                  f"   [{'KHOP' if hit == best_m else 'LECH'} voi best I-D]")
             print(f"[i]   sweep = {sigma_sweep}")
+        if _md("frac_top10") == _md("frac_top10") and _md("frac_top10") < 0.5:
+            print(f"[!!]  top-10% tan so chi giu {_md('frac_top10')*100:.0f}% evidence => TRAI DEU.")
+            print(f"[!!]   Moi rule dua tren 'tam khoi evidence' se kem tin cay o vision.")
         print("[!]  Vision dung GAUSSIAN BLUR (gain = exp(-0.5 σ²ω²)), KHONG phai shrinkage")
-        print("[!]   gain τ/(s+τ). sigma* cat tai TAN SO evidence, khong phai PHUONG SAI")
-        print("[!]   evidence. Hai dai luong KHAC NHAU — chi trung khi Σ stationary (Cor.2).")
-
-    # ---- KNEE (index, f_b) ----
-    if knee_tab:
-        print(f"\n[knee] Kneedle tren (index, f_b) — truc x = INDEX cua sweep")
-        print(f"{'i':>3}{'method':>22}{'f(b)':>10}{'x̂':>8}{'ŷ':>8}{'(1-x̂)-ŷ':>11}")
-        print("-" * 64)
-        for i_, (nm_, fb_, xh, yh, dv) in enumerate(knee_tab):
-            mk = "  <== KNEE" if nm_ == knee_m else ""
-            print(f"{i_:>3}{nm_:>22}{fb_:>10.4f}{xh:>8.3f}{yh:>8.3f}{dv:>11.4f}{mk}")
-        print("-" * 64)
-        ag_k = "KHOP" if knee_m == best_m else "LECH"
-        print(f"[i] knee = {knee_m}   [{ag_k} voi best I-D = {best_m}]")
-        print("[!] index KHONG phai dai luong vat ly. Grid log-deu => i ∝ log sigma, nen day")
-        print("[!]   la knee theo LOG SIGMA. Doi grid (them/bot diem sweep) => doi ket qua.")
+        print("[!]   gain τ/(s+τ). Hai dai luong KHAC NHAU — chi trung khi Σ stationary (Cor.2).")
 
     if best_ratio:
         agree = "KHOP" if best_ratio == best_m else "LECH"
@@ -509,7 +498,7 @@ def main():
 
     diag_pool = []          # [(x, target)] giu lai cho DENSE sigma sweep (--tau_diag)
     sigstar_all = []        # sigma* per-anh (--tau_star), tinh NGAY trong loop
-    sigstar_diag = {"w_ev": [], "sd_log_w": [], "k_eff": []}
+    sigstar_diag = {"w_ev": [], "sd_log_w": [], "k_eff": [], "frac_top10": [], "frac_pos": []}
     for ip, path in enumerate(paths):
         x = preprocess(Image.open(path), size=224, device=device)
         if args.target is None:
@@ -526,11 +515,10 @@ def main():
             _out = model(xg[None])
             _sc = (F_.softmax(_out, 1)[0, target] if args.score == "softmax" else _out[0, target])
             _g, = torch.autograd.grad(_sc, xg)
-            _sig, _sd = _ts.sigma_star_fourier(x.detach(), _g.detach())
+            _sig, _sd = _ts.sigma_star_fourier(x.detach(), _g.detach(), frac=args.star_frac)
             sigstar_all.append(float(_sig))
-            sigstar_diag["w_ev"].append(float(_sd["w_ev"]))
-            sigstar_diag["sd_log_w"].append(float(_sd["sd_log_w"]))
-            sigstar_diag["k_eff"].append(float(_sd["k_eff"]))
+            for _k in ("w_ev", "sd_log_w", "k_eff", "frac_top10", "frac_pos"):
+                sigstar_diag[_k].append(float(_sd[_k]))
         grad_fn = make_resnet50_gradfn(model, target, device, chunk=args.chunk, score=args.score)
 
         # --- DEBUG: baseline strength f(x) vs f(baseline) ---
@@ -570,6 +558,7 @@ def main():
             _print_summary_table(metric_names, acc, id_per_image, ip + 1, bl_strength=bl_strength,
                                  sigma_sweep=args.sigma_sweep,
                                  sigstar=sigstar_all, sigstar_diag=sigstar_diag,
+                                 star_frac=args.star_frac,
                                  title=f"TICH LUY sau {ip+1} anh")
 
     n_img = len(id_per_image)
@@ -581,6 +570,7 @@ def main():
     best_overall = _print_summary_table(metric_names, acc, id_per_image, n_img, bl_strength=bl_strength,
                                         sigma_sweep=args.sigma_sweep,
                                         sigstar=sigstar_all, sigstar_diag=sigstar_diag,
+                                        star_frac=args.star_frac,
                                         title=f"KET QUA CUOI CUNG tren {n_img} anh")
 
     # ---- DOI CHIEU sigma* vs sweep (chay 1 lan o cuoi — can quet lai het sigma) ----

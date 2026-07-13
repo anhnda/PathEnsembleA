@@ -199,6 +199,41 @@ def main():
         tau = float(name.split("@")[1])
         return shrinkage_baseline(x, node_ref, tau)
 
+    # -----------------------------------------------------------------------
+    # DEBUG: baseline "manh" co nao? So f(x) vs f(b_tau(x)) tren tap eval.
+    #   p_full  = softmax(target) tai x that.
+    #   p_base  = softmax(target) tai baseline b_tau(x) (hoac 0).
+    #   ratio   = p_base / p_full   (trung binh).
+    #     ratio ~ 1 : baseline GIU nguyen prediction -> chua xoa duoc thong tin
+    #                 (tau qua nho, b_tau ~ x) -> mask kho hoc.
+    #     ratio -> (1/n_class)/p_full : baseline ve trung tinh (tau lon, b_tau ~ mu).
+    #     ratio < 0.. : baseline LAT sang lop khac (co the OOD, vd zero).
+    #   Cung in |b - x| trung binh (do dich chuyen) va p_base tuyet doi.
+    # -----------------------------------------------------------------------
+    print("\n[DEBUG] baseline strength: f(x) vs f(b_tau(x))")
+    print(f"{'ref':<16}{'p_full':>9}{'p_base':>9}{'ratio p_base/p_full':>22}{'mean|b-x|':>12}")
+    print("-" * 68)
+    with torch.no_grad():
+        for rf in refs:
+            pf_list, pb_list, ratio_list, shift_list = [], [], [], []
+            for g in te_eval:
+                g = g.to(device)
+                x = g.x.float(); ei = g.edge_index
+                target = model(x, ei).argmax(1).item()
+                pf = F.softmax(model(x, ei), 1)[0, target].item()
+                base = baseline_for(rf, x)
+                pb = F.softmax(model(base, ei), 1)[0, target].item()
+                pf_list.append(pf); pb_list.append(pb)
+                ratio_list.append(pb / pf if pf > 1e-9 else float('nan'))
+                shift_list.append((base - x).abs().mean().item())
+            import statistics as st
+            mpf = sum(pf_list)/len(pf_list); mpb = sum(pb_list)/len(pb_list)
+            mr = st.fmean([r for r in ratio_list if r == r]); msh = sum(shift_list)/len(shift_list)
+            tag = "zero(default)" if rf == "zero" else rf
+            print(f"{tag:<16}{mpf:>9.4f}{mpb:>9.4f}{mr:>22.4f}{msh:>12.4f}")
+    print("-" * 68)
+    print("[i] ratio~1 => baseline chua xoa gi (tau nho); ratio thap => baseline trung tinh/lat lop.\n")
+
     print(f"{'GNNExplainer ref':<22}{'PermFid+↑':>11}{'PermFid-↓':>11}{'perm_gap↑':>12}")
     print("-" * 56)
     results = {}

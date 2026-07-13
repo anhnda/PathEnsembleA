@@ -294,3 +294,107 @@ def fringe_tabular(model, x, target, n_class, steps=50, me_steps=100, score="sof
         ds = (s_all[j + 1] - s_all[j])
         phi += g[j] * (x - b0) * ds
     return phi
+
+
+# ===========================================================================
+# ============  BAN NLP (word embedding (1,seq,d), forward = fwd(...))  =====
+# ===========================================================================
+# fwd(model, emb, attention_mask, position_embed, type_embed) -> logits (1,n_class)
+# Representation cho IG2: dung OUTPUT layer (logits) lam rep — hop le theo IG2 paper
+# ("if we use the output layer as representation, no extension is needed").
+
+def _nlp_logits(fwd, model, emb, attn, pos, typ):
+    return fwd(model, emb, attention_mask=attn, position_embed=pos, type_embed=typ)
+
+
+# ---- 1) IG2 NLP (GradCF + GradPath tren word embedding) ----
+def ig2_nlp(fwd, model, word_embed, ref_embed, pred_class, attn, pos, typ,
+            steps=40, step_size=None):
+    """
+    word_embed, ref_embed: (1,seq,d). ref_embed = embedding cua 1 cau LOP KHAC
+    (da pad/truncate cho khop seq, hoac broadcast). Tra ve (attr_token(seq,), attr_full(1,seq,d)).
+    Rep = logits (output layer). CF distance = ||logits(x)-logits(ref)||^2.
+    """
+    with torch.enable_grad():
+        eta = step_size if step_size is not None else (word_embed.abs().mean().item() * 2.0 + 1e-3)
+        with torch.no_grad():
+            ref_logit = _nlp_logits(fwd, model, ref_embed, attn, pos, typ).detach()
+        delta = torch.zeros_like(word_embed)
+        path = [word_embed.detach().clone()]
+        for _ in range(steps):
+            xd = (word_embed + delta).clone().requires_grad_(True)
+            lg = _nlp_logits(fwd, model, xd, attn, pos, typ)
+            d = (lg - ref_logit).pow(2).sum()
+            g, = torch.autograd.grad(d, xd)
+            Wn = g.norm(p=2) + 1e-12
+            delta = (delta - eta * g / Wn).detach()
+            path.append((word_embed + delta).detach().clone())
+        path = path[::-1]                                  # GradCF..x
+        attr_full = torch.zeros_like(word_embed)
+        for j in range(len(path) - 1):
+            gj = path[j].clone().requires_grad_(True)
+            logit = _nlp_logits(fwd, model, gj, attn, pos, typ)[0, pred_class]
+            gf, = torch.autograd.grad(logit, gj, retain_graph=True)
+            lg = _nlp_logits(fwd, model, gj, attn, pos, typ)
+            dcf = (lg - ref_logit).pow(2).sum().sqrt()
+            gc, = torch.autograd.grad(dcf, gj)
+            Wn = gc.norm(p=2) + 1e-12
+            attr_full += (gf.detach() * gc.detach()) * (eta / Wn)
+    attr_token = attr_full.sum(dim=-1).squeeze(0)          # (seq,)
+    return attr_token, attr_full
+
+
+def prep_ref_embed(ref_embed, seq):
+    """Cat/pad ref_embed (1,r,d) cho khop seq: cat neu dai hon, lap/pad neu ngan hon."""
+    r = ref_embed.shape[1]
+    if r == seq:
+        return ref_embed
+    if r > seq:
+        return ref_embed[:, :seq, :]
+    reps = (seq + r - 1) // r
+    return ref_embed.repeat(1, reps, 1)[:, :seq, :]
+
+
+# ---- 2) Max-Entropy baseline NLP (embedding lam uniform output) ----
+def max_entropy_embed(fwd, model, word_embed, n_class, attn, pos, typ,
+                      steps=100, lr=0.05):
+    """Tim base_embed (khoi tu word_embed) -> output ~ uniform. Tra ve (1,seq,d)."""
+    with torch.enable_grad():
+        b = word_embed.detach().clone().requires_grad_(True)
+        opt = torch.optim.Adam([b], lr=lr)
+        logu = torch.full((1, n_class), 1.0 / n_class, device=word_embed.device).log()
+        for _ in range(steps):
+            logp = F.log_softmax(_nlp_logits(fwd, model, b, attn, pos, typ), 1)
+            kl = (logp.exp() * (logp - logu)).sum()
+            opt.zero_grad(); kl.backward(); opt.step()
+    return b.detach()
+
+
+# ---- 3) FRInGe NLP (max-ent ref + Fisher-Rao geodesic path) ----
+def fringe_nlp(fwd, model, word_embed, pred_class, n_class, attn, pos, typ,
+               steps=50, me_steps=100):
+    import math
+    b0 = max_entropy_embed(fwd, model, word_embed, n_class, attn, pos, typ, steps=me_steps)
+    with torch.no_grad():
+        p_x = F.softmax(_nlp_logits(fwd, model, word_embed, attn, pos, typ), 1)[0]
+        p_u = torch.full_like(p_x, 1.0 / n_class)
+        bc = (p_u.sqrt() * p_x.sqrt()).sum().clamp(-1, 1)
+        theta = torch.arccos(bc).item()
+    dev = word_embed.device
+    ts = (torch.arange(steps, device=dev) + 0.5) / steps
+    if theta < 1e-4:
+        s_of_t = ts
+    else:
+        s_of_t = torch.tensor([math.sin(t.item()*theta)/math.sin(theta) for t in ts], device=dev)
+    s_all = torch.cat([torch.zeros(1, device=dev), s_of_t])
+    diff = word_embed - b0
+    attr_full = torch.zeros_like(word_embed)
+    with torch.enable_grad():
+        for j in range(steps):
+            emb = (b0 + s_of_t[j] * diff).clone().requires_grad_(True)
+            logit = _nlp_logits(fwd, model, emb, attn, pos, typ)[0, pred_class]
+            g, = torch.autograd.grad(logit, emb)
+            ds = (s_all[j + 1] - s_all[j])
+            attr_full += g.detach() * diff * ds
+    attr_token = attr_full.sum(dim=-1).squeeze(0)
+    return attr_token, attr_full

@@ -58,6 +58,9 @@ from soft_faith import (
     calculate_soft_log_odds,
 )
 from stats_utils import paired_t, wilcoxon, mean_se   # module stat doc lap
+from pea.baselines_rival import (
+    ig2_nlp, prep_ref_embed, max_entropy_embed, fringe_nlp,
+)
 
 
 MODEL_MAP = {
@@ -93,6 +96,9 @@ def parse_args():
                     help="so token gom tu tap ref de uoc luong mu,Sigma embedding")
     ap.add_argument("--ref_sents", type=int, default=500, help="so cau quet de gom token ref")
     ap.add_argument("--n_soft", type=int, default=10, help="so mau Bernoulli cho soft metric")
+    ap.add_argument("--rivals", action="store_true", help="bat IG2 / Max-Entropy / FRInGe")
+    ap.add_argument("--ig2_steps", type=int, default=40)
+    ap.add_argument("--me_steps", type=int, default=100)
     ap.add_argument("--max_len", type=int, default=128)
     ap.add_argument("--include_special", action="store_true",
                     help="tinh attribution ca [CLS]/[SEP]/[PAD] (mac dinh bo)")
@@ -286,6 +292,8 @@ def main():
     methods += [f"EG-{K}" for K in args.eg_K]
     methods += [f"Shrinkage-IG@{t:g}" for t in args.tau_sweep]
     methods += ["PM-IG-PPCA"]
+    if args.rivals:
+        methods += ["IG-MaxEnt", "FRInGe", "IG2"]
 
     def baseline_embed_for(name, word_embed):
         """Tra ve base_embed (1,seq,d) cho method. word_embed: (1,seq,d)."""
@@ -317,6 +325,30 @@ def main():
 
     special_ids = set(tokenizer.all_special_ids)
 
+    # --- doi trong: CF reference embedding cho IG2 (1 cau lop khac, dung chung) ---
+    n_class_nlp = model.config.num_labels
+    ig2_ref_embed = None
+    if args.rivals:
+        # tim 1 cau trong sample co pred class khac cau dau -> lam CF reference
+        with torch.no_grad():
+            base_cls = None
+            for text, _l in sample:
+                enc = tokenizer(text, truncation=True, max_length=args.max_len, return_tensors="pt").to(device)
+                we, pe, te = get_embeddings(model, args.model, enc["input_ids"], enc["attention_mask"])
+                pc = int(fwd(model, we, attention_mask=enc["attention_mask"],
+                             position_embed=pe, type_embed=te).argmax(-1).item())
+                if base_cls is None:
+                    base_cls = pc
+                elif pc != base_cls:
+                    ig2_ref_embed = we.detach()             # (1,r,d)
+                    break
+        if ig2_ref_embed is None:                           # fallback: cau dau
+            enc = tokenizer(sample[0][0], truncation=True, max_length=args.max_len, return_tensors="pt").to(device)
+            we, _, _ = get_embeddings(model, args.model, enc["input_ids"], enc["attention_mask"])
+            ig2_ref_embed = we.detach()
+        print(f"[i] RIVALS bat: IG2/MaxEnt/FRInGe (ig2_steps={args.ig2_steps}, me_steps={args.me_steps}), "
+              f"CF ref seq={ig2_ref_embed.shape[1]}\n")
+
     for si, (text, _label) in enumerate(sample):
         enc = tokenizer(text, truncation=True, max_length=args.max_len, return_tensors="pt").to(device)
         input_ids = enc["input_ids"]
@@ -337,7 +369,48 @@ def main():
                     keep_tok[j] = False
 
         for nm in methods:
-            if nm.startswith("EG-"):
+            if nm == "IG2":
+                ref_e = prep_ref_embed(ig2_ref_embed, word_embed.shape[1])
+                _, attr_full = ig2_nlp(fwd, model, word_embed, ref_e, pred_class,
+                                       attn, position_embed, type_embed, steps=args.ig2_steps)
+                with torch.no_grad():
+                    ref_e2 = prep_ref_embed(ig2_ref_embed, word_embed.shape[1])
+                    pf = F.softmax(logits, -1)[0, pred_class].item()
+                    # "baseline" cua IG2 = GradCF; xap xi strength bang ref (lop khac)
+                    pb = F.softmax(fwd(model, ref_e2, attention_mask=attn,
+                                       position_embed=position_embed, type_embed=type_embed), -1)[0, pred_class].item()
+                    shift = (ref_e2 - word_embed).abs()[0][keep_tok].mean().item() if keep_tok.any() else 0.0
+                d = bl_strength.setdefault(nm, {"pf": [], "pb": [], "ratio": [], "shift": []})
+                d["pf"].append(pf); d["pb"].append(pb)
+                d["ratio"].append(pb/pf if pf > 1e-9 else float("nan")); d["shift"].append(shift)
+            elif nm == "FRInGe":
+                _, attr_full = fringe_nlp(fwd, model, word_embed, pred_class, n_class_nlp,
+                                          attn, position_embed, type_embed,
+                                          steps=args.steps, me_steps=args.me_steps)
+                with torch.no_grad():
+                    b0 = max_entropy_embed(fwd, model, word_embed, n_class_nlp, attn,
+                                           position_embed, type_embed, steps=args.me_steps)
+                    pf = F.softmax(logits, -1)[0, pred_class].item()
+                    pb = F.softmax(fwd(model, b0, attention_mask=attn, position_embed=position_embed,
+                                       type_embed=type_embed), -1)[0, pred_class].item()
+                    shift = (b0 - word_embed).abs()[0][keep_tok].mean().item() if keep_tok.any() else 0.0
+                d = bl_strength.setdefault(nm, {"pf": [], "pb": [], "ratio": [], "shift": []})
+                d["pf"].append(pf); d["pb"].append(pb)
+                d["ratio"].append(pb/pf if pf > 1e-9 else float("nan")); d["shift"].append(shift)
+            elif nm == "IG-MaxEnt":
+                be = max_entropy_embed(fwd, model, word_embed, n_class_nlp, attn,
+                                       position_embed, type_embed, steps=args.me_steps)
+                _, attr_full = ig_embedding(fwd, model, word_embed, be, position_embed, type_embed,
+                                            attn, pred_class, args.steps)
+                with torch.no_grad():
+                    pf = F.softmax(logits, -1)[0, pred_class].item()
+                    pb = F.softmax(fwd(model, be, attention_mask=attn, position_embed=position_embed,
+                                       type_embed=type_embed), -1)[0, pred_class].item()
+                    shift = (be - word_embed).abs()[0][keep_tok].mean().item() if keep_tok.any() else 0.0
+                d = bl_strength.setdefault(nm, {"pf": [], "pb": [], "ratio": [], "shift": []})
+                d["pf"].append(pf); d["pb"].append(pb)
+                d["ratio"].append(pb/pf if pf > 1e-9 else float("nan")); d["shift"].append(shift)
+            elif nm.startswith("EG-"):
                 K = int(nm.split("-")[1])
                 # EG: trung binh attr_full tren K baseline sample, ngan sach chia deu
                 steps_k = max(2, args.steps // K)

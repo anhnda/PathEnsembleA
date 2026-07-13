@@ -344,6 +344,28 @@ def _print_summary_table(metric_names, acc, id_per_image, n_img, title, bl_stren
                 ratio_dx[m] = df_ / sh_ if sh_ > 1e-12 else float("nan")
     best_ratio = max(ratio_dx, key=ratio_dx.get) if ratio_dx else None
 
+    # ---- KNEE tren (index, f_b) — Kneedle chuan, truc x = INDEX cua sweep ----
+    # Toa do [i, f_i], chuan hoa ca hai truc ve [0,1], duong cong GIAM
+    # => knee = diem xa nhat duoi duong cheo (0,1)->(1,0), tuc max (1-x̂) - ŷ.
+    #
+    # LUU Y: index KHONG phai dai luong vat ly. Voi grid log-deu thi i ∝ log sigma,
+    # nen day thuc chat la knee cua f_b theo LOG SIGMA. Doi grid (them/bot diem
+    # sweep) thi doi ket qua. In ra de doi chieu, KHONG phai de tin ngay.
+    knee_m, knee_tab = None, []
+    if bl_strength and sigma_sweep:
+        sk = [f"Shrinkage-IG@{sg:g}" for sg in sorted(sigma_sweep)]
+        sk = [m for m in sk if m in bl_strength and bl_strength[m].get("pb")]
+        if len(sk) >= 3:
+            fb_ = [sum(bl_strength[m]["pb"]) / len(bl_strength[m]["pb"]) for m in sk]
+            T_ = len(sk)
+            lo_, hi_ = min(fb_), max(fb_)
+            rng = (hi_ - lo_) if (hi_ - lo_) > 1e-12 else 1.0
+            for i_ in range(T_):
+                xh = i_ / (T_ - 1)
+                yh = (fb_[i_] - lo_) / rng           # giam tu 1 -> 0
+                knee_tab.append((sk[i_], fb_[i_], xh, yh, (1.0 - xh) - yh))
+            knee_m = max(knee_tab, key=lambda r: r[4])[0]
+
     print(f"\n--- {title} (mean±SE tren {n_img} anh) ---")
     print(f"{'method':<20}{'insertion↑':>16}{'deletion↓':>16}{'I-D↑':>16}{'win%':>7}"
           f"{'f(x)':>8}{'f(b)':>8}{'Δf':>9}{'|b-x|₂':>10}{'Δf/|b-x|':>12}")
@@ -405,6 +427,20 @@ def _print_summary_table(metric_names, acc, id_per_image, n_img, title, bl_stren
         print("[!]   gain τ/(s+τ). sigma* cat tai TAN SO evidence, khong phai PHUONG SAI")
         print("[!]   evidence. Hai dai luong KHAC NHAU — chi trung khi Σ stationary (Cor.2).")
 
+    # ---- KNEE (index, f_b) ----
+    if knee_tab:
+        print(f"\n[knee] Kneedle tren (index, f_b) — truc x = INDEX cua sweep")
+        print(f"{'i':>3}{'method':>22}{'f(b)':>10}{'x̂':>8}{'ŷ':>8}{'(1-x̂)-ŷ':>11}")
+        print("-" * 64)
+        for i_, (nm_, fb_, xh, yh, dv) in enumerate(knee_tab):
+            mk = "  <== KNEE" if nm_ == knee_m else ""
+            print(f"{i_:>3}{nm_:>22}{fb_:>10.4f}{xh:>8.3f}{yh:>8.3f}{dv:>11.4f}{mk}")
+        print("-" * 64)
+        ag_k = "KHOP" if knee_m == best_m else "LECH"
+        print(f"[i] knee = {knee_m}   [{ag_k} voi best I-D = {best_m}]")
+        print("[!] index KHONG phai dai luong vat ly. Grid log-deu => i ∝ log sigma, nen day")
+        print("[!]   la knee theo LOG SIGMA. Doi grid (them/bot diem sweep) => doi ket qua.")
+
     if best_ratio:
         agree = "KHOP" if best_ratio == best_m else "LECH"
         print(f"[i] max Δf/|b-x| = {best_ratio} ({ratio_dx[best_ratio]:.5g})   [{agree} voi best I-D]")
@@ -415,6 +451,23 @@ def _print_summary_table(metric_names, acc, id_per_image, n_img, title, bl_stren
         print(f"[i] xep hang I-D      : {' > '.join(rk_i[:5])}")
         print("[i]   Chi dung FORWARD PASS. Neu hai xep hang KHOP => chon duoc sigma ma KHONG")
         print("[i]   cham insertion/deletion.")
+
+    # ---- TONG HOP: 4 rule vs best I-D ----
+    print(f"\n[TONG HOP] n={n_img} anh")
+    print(f"{'rule':<24}{'chon':>22}{'  vs best I-D':>14}")
+    print("-" * 62)
+    print(f"{'best I-D (ORACLE)':<24}{best_m:>22}{'':>14}")
+    if knee_m:
+        print(f"{'knee (index, f_b)':<24}{knee_m:>22}{('KHOP' if knee_m==best_m else 'LECH'):>14}")
+    if best_ratio:
+        print(f"{'max Δf/|b-x|':<24}{best_ratio:>22}"
+              f"{('KHOP' if best_ratio==best_m else 'LECH'):>14}")
+    if sigstar and sigma_sweep:
+        ss2 = sorted(sigstar); md2 = ss2[len(ss2)//2]
+        nr = min(sigma_sweep, key=lambda sg: abs(math.log(max(sg,1e-9))-math.log(max(md2,1e-9))))
+        hm = f"Shrinkage-IG@{nr:g}"
+        print(f"{'sigma* (closed form)':<24}{hm:>22}{('KHOP' if hm==best_m else 'LECH'):>14}")
+    print("-" * 62)
     return best_m
 
 

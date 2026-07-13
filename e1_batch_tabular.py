@@ -259,9 +259,9 @@ def main():
                          "id_gap": gap_t.mean().item(), "id_se": se,
                          "rank_key": sum(ncs) / len(ncs),          # xep hang theo Soft-NC
                          "nc_list": ncs}                            # cho paired test theo NC
-            fx, fxt, rt, sh = _fmt_strength(bl_str.get(nm))
+            scol = _fmt_strength(bl_str.get(nm))
             print(f"{nm:<20}{table[nm]['soft_nc']:>12.4f}{table[nm]['soft_ns']:>12.4f}"
-                  f"{table[nm]['id_gap']:>12.4f}{fx}{fxt}{rt}{sh}   ± {se:.4f}")
+                  f"{table[nm]['id_gap']:>12.4f}{scol}   ± {se:.4f}")
     else:
         print(f"{'method':<20}{'insertion↑':>12}{'deletion↓':>12}{'I-D↑':>10}"
               f"{'f(x)':>8}{'f(xt)':>8}{'ratio':>8}{'|b-x|':>9}"
@@ -297,9 +297,9 @@ def main():
                          "id_gap": per_sample_gap.mean().item(), "id_se": se,
                          "seed_std": seed_std, "n_seeds": len(seeds)}
             tail = f"   ± {se:.4f}" + (f"  [seed-std {seed_std:.4f}, n={len(seeds)}]" if len(seeds) > 1 else "")
-            fx, fxt, rt, sh = _fmt_strength(bl_str.get(nm))
+            scol = _fmt_strength(bl_str.get(nm))
             print(f"{nm:<20}{table[nm]['insertion']:>12.4f}{table[nm]['deletion']:>12.4f}"
-                  f"{table[nm]['id_gap']:>10.4f}{fx}{fxt}{rt}{sh}{tail}")
+                  f"{table[nm]['id_gap']:>10.4f}{scol}{tail}")
 
     gap_label = "Soft-gap" if args.metric == "soft" else "I-D"
     print("-" * 68)

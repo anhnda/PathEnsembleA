@@ -52,6 +52,7 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from datasets import load_dataset
 
 from synthetic_e0 import fit_reference, shrinkage_baseline, fit_ppca
+import tau_diag
 from soft_faith import (
     calculate_soft_sufficiency,
     calculate_soft_comprehensiveness,
@@ -95,6 +96,12 @@ def parse_args():
     ap.add_argument("--ref_size", type=int, default=4000,
                     help="so token gom tu tap ref de uoc luong mu,Sigma embedding")
     ap.add_argument("--ref_sents", type=int, default=500, help="so cau quet de gom token ref")
+    # --- TAU-DIAGNOSTIC ---
+    ap.add_argument("--tau_diag", action="store_true",
+                    help="quet DENSE tau, log rho/Δf/|b-x|₂/SNR PER-CAU + rules (chi forward pass)")
+    ap.add_argument("--diag_n", type=int, default=25)
+    ap.add_argument("--diag_gamma", action="store_true", help="grid scale-free tau = gamma*s_bar")
+    ap.add_argument("--diag_delta", type=float, default=0.05)
     ap.add_argument("--n_soft", type=int, default=10, help="so mau Bernoulli cho soft metric")
     ap.add_argument("--rivals", action="store_true", help="bat IG2 / Max-Entropy / FRInGe")
     ap.add_argument("--ig2_steps", type=int, default=40)
@@ -317,6 +324,100 @@ def main():
             return shrinkage_baseline(we, ppca_ref, tau=psi).unsqueeze(0)
         raise ValueError(name)
 
+    # =====================================================================
+    # TAU-DIAGNOSTIC (NLP): quet dense, per-CAU. Chi forward pass.
+    # LUU Y NLP: log hien tai cho IG-zero THANG, moi Shrinkage deu thua, va
+    # ratio(zero)=0.48 ~ ratio(mean)=0.495. Nghi van: zero-embedding KHONG
+    # off-distribution nhu gia dinh => (P2) co the KHONG bi vi pham => hang
+    # "zero ✗" trong Table 1 SAI o modality nay. Cot maha_b/P2 tra loi cai do.
+    # =====================================================================
+    if args.tau_diag:
+        PR = tau_diag.participation_ratio(ref.s)
+        d_emb = X_ref.shape[1]
+        s_bar = tau_diag.effective_tau_scale(ref.s, "mean")
+        print(f"\n=== PHO CUA SIGMA (embedding) ===")
+        print(f"[i] d = {d_emb},  PR = {PR:.2f}  ({PR/d_emb*100:.1f}% cua d)")
+        print(f"[i] s_bar = {s_bar:.6g}  s_max = {ref.s.max():.6g}  s_min = {ref.s.min():.6g}")
+        if PR >= 0.2 * d_emb:
+            print("[!] PR LON => knee MO => rule chon tau se bat dinh o modality nay.")
+
+        if args.diag_gamma:
+            taus_d, sb = tau_diag.gamma_grid(ref.s, 1e-2, 1e2, args.diag_n)
+            print(f"[i] grid scale-free tau = gamma*s_bar, s_bar={sb:.6g}")
+        else:
+            taus_d = tau_diag.log_tau_grid(1e-2 * s_bar, 1e2 * s_bar, args.diag_n)
+
+        # chuan bi cac example (encode 1 lan)
+        exs = []
+        for text, _l in sample:
+            enc = tokenizer(text, truncation=True, max_length=args.max_len,
+                            return_tensors="pt").to(device)
+            we, pe, te = get_embeddings(model, args.model, enc["input_ids"], enc["attention_mask"])
+            with torch.no_grad():
+                lg = fwd(model, we, attention_mask=enc["attention_mask"],
+                         position_embed=pe, type_embed=te)
+                pc = int(lg.argmax(-1).item())
+            kt = torch.ones(enc["input_ids"].shape[1], dtype=torch.bool, device=device)
+            if not args.include_special:
+                for j, tid in enumerate(enc["input_ids"][0].tolist()):
+                    if tid in set(tokenizer.all_special_ids):
+                        kt[j] = False
+            exs.append({"we": we, "pe": pe, "te": te, "attn": enc["attention_mask"],
+                        "pc": pc, "keep": kt})
+
+        @torch.no_grad()
+        def _score_one(it, emb):
+            lg = fwd(model, emb, attention_mask=it["attn"],
+                     position_embed=it["pe"], type_embed=it["te"])
+            return F.softmax(lg, -1)[0, it["pc"]].item()
+
+        @torch.no_grad()
+        def _maha_one(it, emb):
+            # ||b - mu||_{Sigma^-1} trung binh tren token thuong
+            z = emb[0][it["keep"]] if it["keep"].any() else emb[0]
+            c = (z - ref.mu[None]) @ ref.V
+            return (((c ** 2) / ref.s.clamp_min(1e-12)[None]).sum(1).sqrt()).mean().item()
+
+        curve = tau_diag.sweep_curve_varlen(
+            exs,
+            score_one=_score_one,
+            embed_of=lambda it: it["we"],
+            baseline_one=lambda it, x, t: shrinkage_baseline(x[0], ref, tau=t).unsqueeze(0),
+            taus=taus_d,
+            mu_baseline=lambda it: mu.view(1, 1, -1).expand(1, it["we"].shape[1], -1).contiguous(),
+            maha_one=_maha_one,
+            mask_one=lambda it: it["keep"],
+        )
+        tau_diag.print_curve_table(curve, tag=f"[nlp/{args.model}/{args.dataset}]")
+
+        # cac baseline CO DINH, cung don vi -> tra loi cau hoi zero co vi pham (P2) khong
+        print(f"\n{'fixed baseline':<20}{'rho':>10}{'Δf':>10}{'|b-x|₂':>10}{'SNR':>10}"
+              f"{'|b-mu|_S-1':>13}{'P2 ok':>9}")
+        print("-" * 82)
+        maha_x_mean = curve["maha_x"].mean().item()
+        for nm in ["IG-zero", "IG-pad", "IG-mask", "IG-mean", "IG-random"]:
+            rr, dd, ss, mm, p2 = [], [], [], [], []
+            for it in exs:
+                x = it["we"]
+                b = baseline_embed_for(nm, x)
+                fx = _score_one(it, x); fb = _score_one(it, b)
+                sh = (x - b)[0][it["keep"]].norm().item() if it["keep"].any() else (x-b).norm().item()
+                mb = _maha_one(it, b); mx = _maha_one(it, x)
+                rr.append(fb/max(fx,1e-12)); dd.append(fx-fb); ss.append((fx-fb)/max(sh**2,1e-20))
+                mm.append(mb); p2.append(1.0 if mb <= mx else 0.0)
+            n_ = len(rr)
+            shm = sum((x - baseline_embed_for(nm, x))[0][it["keep"]].norm().item()
+                      for it, x in ((e, e["we"]) for e in exs)) / n_
+            print(f"{nm:<20}{sum(rr)/n_:>10.4f}{sum(dd)/n_:>10.4f}{shm:>10.4f}"
+                  f"{sum(ss)/n_:>10.3f}{sum(mm)/n_:>13.4f}{sum(p2)/n_*100:>8.0f}%")
+        print(f"[i] |x-mu|_S-1 = {maha_x_mean:.4f}  (Mahalanobis cua chinh input)")
+        print("[i] Neu IG-zero P2 ok% CAO => zero KHONG vi pham (P2) o embedding space")
+        print("[i] => Table 1 hang 'zero ✗' SAI cho NLP, va viec zero THANG khong con la nghich ly.")
+
+        rules, valid_m = tau_diag.selection_rules(curve, delta=args.diag_delta)
+        tau_diag.print_rules_table(rules, valid=valid_m)
+        tau_diag.dump_curve_csv(curve, f"e1_nlp_{args.dataset}_taucurve.csv")
+
     # ---- accumulators ----
     metric_keys = ["soft_nc", "soft_ns", "soft_logodds"]
     acc = {m: {k: [] for k in metric_keys} for m in methods}
@@ -379,10 +480,11 @@ def main():
                     # "baseline" cua IG2 = GradCF; xap xi strength bang ref (lop khac)
                     pb = F.softmax(fwd(model, ref_e2, attention_mask=attn,
                                        position_embed=position_embed, type_embed=type_embed), -1)[0, pred_class].item()
-                    shift = (ref_e2 - word_embed).abs()[0][keep_tok].mean().item() if keep_tok.any() else 0.0
-                d = bl_strength.setdefault(nm, {"pf": [], "pb": [], "ratio": [], "shift": []})
+                    shift = (ref_e2 - word_embed)[0][keep_tok].norm().item() if keep_tok.any() else 0.0   # L2, khong phai L1-mean
+                d = bl_strength.setdefault(nm, {"pf": [], "pb": [], "ratio": [], "shift": [], "df": [], "snr": []})
                 d["pf"].append(pf); d["pb"].append(pb)
                 d["ratio"].append(pb/pf if pf > 1e-9 else float("nan")); d["shift"].append(shift)
+                d["df"].append(pf - pb); d["snr"].append((pf - pb) / max(shift**2, 1e-20))
             elif nm == "FRInGe":
                 _, attr_full = fringe_nlp(fwd, model, word_embed, pred_class, n_class_nlp,
                                           attn, position_embed, type_embed,
@@ -393,10 +495,11 @@ def main():
                     pf = F.softmax(logits, -1)[0, pred_class].item()
                     pb = F.softmax(fwd(model, b0, attention_mask=attn, position_embed=position_embed,
                                        type_embed=type_embed), -1)[0, pred_class].item()
-                    shift = (b0 - word_embed).abs()[0][keep_tok].mean().item() if keep_tok.any() else 0.0
-                d = bl_strength.setdefault(nm, {"pf": [], "pb": [], "ratio": [], "shift": []})
+                    shift = (b0 - word_embed)[0][keep_tok].norm().item() if keep_tok.any() else 0.0   # L2, khong phai L1-mean
+                d = bl_strength.setdefault(nm, {"pf": [], "pb": [], "ratio": [], "shift": [], "df": [], "snr": []})
                 d["pf"].append(pf); d["pb"].append(pb)
                 d["ratio"].append(pb/pf if pf > 1e-9 else float("nan")); d["shift"].append(shift)
+                d["df"].append(pf - pb); d["snr"].append((pf - pb) / max(shift**2, 1e-20))
             elif nm == "IG-MaxEnt":
                 be = max_entropy_embed(fwd, model, word_embed, n_class_nlp, attn,
                                        position_embed, type_embed, steps=args.me_steps)
@@ -406,10 +509,11 @@ def main():
                     pf = F.softmax(logits, -1)[0, pred_class].item()
                     pb = F.softmax(fwd(model, be, attention_mask=attn, position_embed=position_embed,
                                        type_embed=type_embed), -1)[0, pred_class].item()
-                    shift = (be - word_embed).abs()[0][keep_tok].mean().item() if keep_tok.any() else 0.0
-                d = bl_strength.setdefault(nm, {"pf": [], "pb": [], "ratio": [], "shift": []})
+                    shift = (be - word_embed)[0][keep_tok].norm().item() if keep_tok.any() else 0.0   # L2, khong phai L1-mean
+                d = bl_strength.setdefault(nm, {"pf": [], "pb": [], "ratio": [], "shift": [], "df": [], "snr": []})
                 d["pf"].append(pf); d["pb"].append(pb)
                 d["ratio"].append(pb/pf if pf > 1e-9 else float("nan")); d["shift"].append(shift)
+                d["df"].append(pf - pb); d["snr"].append((pf - pb) / max(shift**2, 1e-20))
             elif nm.startswith("EG-"):
                 K = int(nm.split("-")[1])
                 # EG: trung binh attr_full tren K baseline sample, ngan sach chia deu
@@ -432,15 +536,18 @@ def main():
                     lb = fwd(model, be, attention_mask=attn,
                              position_embed=position_embed, type_embed=type_embed)
                     pb = F.softmax(lb, dim=-1)[0, pred_class].item()
-                    # |b-x| chi tren token thuong (bo special) neu co the
-                    diff = (be - word_embed).abs()
+                    # |b-x|_2 chi tren token thuong (bo special) neu co the
+                    # SUA: truoc day dung .abs().mean() = L1/D, KHONG phai quang duong
+                    # Euclid. Meo mo IG ~ O(L*||b-x||_2^2), nen phai la L2 norm.
+                    diff = (be - word_embed)
                     if not args.include_special and keep_tok.any():
-                        shift = diff[0][keep_tok].mean().item()
+                        shift = diff[0][keep_tok].norm().item()
                     else:
-                        shift = diff.mean().item()
-                d = bl_strength.setdefault(nm, {"pf": [], "pb": [], "ratio": [], "shift": []})
+                        shift = diff.reshape(-1).norm().item()
+                d = bl_strength.setdefault(nm, {"pf": [], "pb": [], "ratio": [], "shift": [], "df": [], "snr": []})
                 d["pf"].append(pf); d["pb"].append(pb)
                 d["ratio"].append(pb / pf if pf > 1e-9 else float("nan")); d["shift"].append(shift)
+                d["df"].append(pf - pb); d["snr"].append((pf - pb) / max(shift**2, 1e-20))
 
             # sanitize: rival co the tao attr NaN/Inf/scale lon -> soft metric vo Bernoulli p ngoai [0,1]
             attr_full = torch.nan_to_num(attr_full, nan=0.0, posinf=0.0, neginf=0.0)
@@ -478,8 +585,8 @@ def main():
                               for nc, ns in zip(acc[m]["soft_nc"], acc[m]["soft_ns"])]
     print(f"\n{'='*116}\nKET QUA E1-NLP tren {n} cau  ({args.model}/{args.dataset})")
     print(f"{'method':<20}{'Soft-NC↑':>15}{'Soft-NS↑':>15}{'Soft-gap↑':>15}{'Soft-logodds↑':>18}"
-          f"{'f(x)':>8}{'f(xt)':>8}{'ratio':>8}{'|b-x|':>9}")
-    print("-" * 116)
+          f"{'f(x)':>8}{'f(b)':>8}{'ratio':>8}{'|b-x|₂':>9}{'Δf':>9}{'SNR':>9}")
+    print("-" * 134)
     # best theo Soft-gap (tinh truoc de danh dau)
     gap_means = {m: mean_se(acc[m]["soft_gap"])[0] for m in methods}
     best_m = max(gap_means, key=gap_means.get)
@@ -492,6 +599,7 @@ def main():
         lo_m, lo_se = mean_se(acc[m]["soft_logodds"])
         # f(x)/f(xt)/ratio/|b-x| (EG khong co baseline diem -> "-")
         fx, fxt, rtxt, stxt = "   -  ", "   -  ", "   -  ", "    -   "
+        dftxt, sntxt = "    -   ", "    -   "
         if m in bl_strength:
             d = bl_strength[m]
             if d["pf"]:   fx  = f"{sum(d['pf'])/len(d['pf']):>6.4f}"
@@ -499,10 +607,13 @@ def main():
             rr = [r for r in d["ratio"] if r == r]
             if rr:        rtxt = f"{sum(rr)/len(rr):>6.4f}"
             if d["shift"]:stxt = f"{sum(d['shift'])/len(d['shift']):>8.4f}"
+            # Δf = f(x)-f(b) = ngan sach Completeness; SNR = Δf/|b-x|_2^2
+            if d["df"]:   dftxt = f"{sum(d['df'])/len(d['df']):>8.4f}"
+            if d["snr"]:  sntxt = f"{sum(d['snr'])/len(d['snr']):>8.3f}"
         mark = "  <-- best" if m == best_m else ""
         print(f"{m:<20}{nc_m:>8.4f}±{nc_se:<5.4f}{ns_m:>8.4f}±{ns_se:<5.4f}"
               f"{gp_m:>8.4f}±{gp_se:<5.4f}{lo_m:>10.4f}±{lo_se:<6.4f}"
-              f"{fx:>8}{fxt:>8}{rtxt:>8}{stxt:>9}{mark}")
+              f"{fx:>8}{fxt:>8}{rtxt:>8}{stxt:>9}{dftxt:>9}{sntxt:>9}{mark}")
         summary_rows.append({"method": m, "n": n,
                              "soft_nc_mean": nc_m, "soft_nc_se": nc_se,
                              "soft_ns_mean": ns_m, "soft_ns_se": ns_se,

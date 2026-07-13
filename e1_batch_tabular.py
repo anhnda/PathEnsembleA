@@ -229,7 +229,24 @@ def main():
         idx = torch.randperm(Xtr.shape[0], generator=gg)[:max(args.eg_K)]
         return Xtr[idx]
 
-    def attr_for(name, x, rng_seed=None):
+    # tau PER-INPUT do cac rule chon (dien boi khoi --tau_diag / --tau_star ben duoi).
+    # {rule_name: (M,) tensor tau}. Index i khop voi X_eval[i].
+    # {rule_name: (M,) tensor tau}. Index khop voi X_eval[i].
+    # LUU Y: X_eval[i] tao tensor MOI moi lan => KHONG dung id(x) lam key duoc.
+    # Phai truyen INDEX i thang vao attr_for/baseline_vec_for.
+    adaptive_tau = {}
+
+    def _tau_of(rule, i):
+        t = adaptive_tau.get(rule)
+        return float(t[i]) if (t is not None and i is not None) else None
+
+    def attr_for(name, x, rng_seed=None, i=None):
+        if name.startswith("Shrinkage-Adaptive-"):
+            rule = name[len("Shrinkage-Adaptive-"):]
+            t = _tau_of(rule, i)
+            if t is None:
+                raise ValueError(f"thieu tau cho rule {rule} (input {i}) — can --tau_diag/--tau_star")
+            return ig_tabular(x, shrinkage_baseline(x, ref, tau=t), grad_fn, T=N)
         if name == "IG-zero":   return ig_tabular(x, zero, grad_fn, T=N)
         if name == "IG-mean":   return ig_tabular(x, mu, grad_fn, T=N)
         if name == "IG-median": return ig_tabular(x, med, grad_fn, T=N)
@@ -261,8 +278,11 @@ def main():
     def is_stochastic(name):
         return name == "IG-random" or name.startswith("EG-")
 
-    def baseline_vec_for(name, x):
+    def baseline_vec_for(name, x, i=None):
         """Baseline DIEM cho method (khop attr_for). None neu khong 1-diem (EG/random pool)."""
+        if name.startswith("Shrinkage-Adaptive-"):
+            t = _tau_of(name[len("Shrinkage-Adaptive-"):], i)
+            return shrinkage_baseline(x, ref, tau=t) if t is not None else None
         if name == "IG-zero":   return zero
         if name == "IG-mean":   return mu
         if name == "IG-median": return med
@@ -301,21 +321,20 @@ def main():
             (khong co dist_norm/amp: chung modality-specific, xem tau_diag.py)
             maha_b, P2_ok       <- kiem tra (P2) contraction cho tung baseline
         """
-        if baseline_vec_for(name, X_eval[0]) is None:
+        if baseline_vec_for(name, X_eval[0], i=0) is None:
             return None
+        # fixed_baseline_diag goi b_fn(X_eval[i]) — ta bao no index bang closure counter
+        _ctr = {"i": -1}
+        def _bfn(x):
+            _ctr["i"] += 1
+            return baseline_vec_for(name, x, i=_ctr["i"])
         return tau_diag.fixed_baseline_diag(
             X_eval,
             lambda Z: score_target(model, Z, target=target, score="softmax"),
-            lambda x: baseline_vec_for(name, x),
+            _bfn,
             ref_s=ref.s, ref_V=ref.V, ref_mu=ref.mu,
         )
 
-    methods = ["IG-zero", "IG-mean", "IG-median", "IG-random"]
-    methods += [f"EG-{K}" for K in args.eg_K]
-    methods += [f"Shrinkage-IG@{t:g}" for t in args.tau_sweep]
-    methods += ["PM-IG-PPCA"]
-    if args.rivals:
-        methods += ["IG-MaxEnt", "FRInGe", "IG2"]
     print(f"[i] PM-IG-PPCA psi(estimated) = {psi:.4f}  (rank q={min(args.ppca_q, D-1)})")
     print(f"[i] metric = {args.metric}"
           + (f"  (insertion/deletion remove-to-{args.insdel_mode})\n" if args.metric == "insdel"
@@ -394,6 +413,12 @@ def main():
         tau_diag.print_rules_table(rules, oracle=oracle, valid=valid_m)
         if oracle is not None:
             tau_diag.print_per_input_agreement(rules, oracle, curve["taus"], valid=valid_m)
+        # -> Shrinkage-Adaptive: tau PER-INPUT tu moi rule
+        for _r, _t in rules.items():
+            if not _r.startswith("_"):
+                adaptive_tau[_r.replace("tau_", "")] = _t.clone()
+        if oracle is not None:
+            adaptive_tau["oracle"] = oracle.clone()   # tran tren: tau tot nhat co the
 
         # (6) CSV long-format — de fit rule offline, dung suy dien tu 4 diem nua
         extra = {"id_gap": curve["_id_per_tau"]} if "_id_per_tau" in curve else None
@@ -436,6 +461,33 @@ def main():
                 Lm[:, j] = (X_eval - B).norm(dim=1)
         taustar.compare_rules(torch.tensor(taus_cmp, device=device, dtype=torch.float),
                               Lm, Dm, tstar)
+        adaptive_tau["star"] = tstar.clone()          # -> Shrinkage-Adaptive-star
+
+    # =====================================================================
+    # DANG KY METHODS — sau khi cac rule da chon xong tau per-input.
+    # Shrinkage-Adaptive-<rule> = IG voi baseline b_{tau_i(x_i)}(x_i), tau RIENG
+    # cho tung input do rule chon. Day la thu DUY NHAT kiem duoc rule co dung
+    # khong: moi rule truoc gio chi duoc BAO CAO, chua he duoc dung de TAO
+    # attribution roi cham diem.
+    # =====================================================================
+    methods = ["IG-zero", "IG-mean", "IG-median", "IG-random"]
+    methods += [f"EG-{K}" for K in args.eg_K]
+    methods += [f"Shrinkage-IG@{t:g}" for t in args.tau_sweep]
+    methods += ["PM-IG-PPCA"]
+    for _r in sorted(adaptive_tau):
+        methods.append(f"Shrinkage-Adaptive-{_r}")
+    if args.rivals:
+        methods += ["IG-MaxEnt", "FRInGe", "IG2"]
+    if adaptive_tau:
+        print(f"[i] Shrinkage-Adaptive: {len(adaptive_tau)} rule -> "
+              f"{', '.join(sorted(adaptive_tau))}")
+        for _r, _t in sorted(adaptive_tau.items()):
+            _q = torch.quantile(_t.double(), torch.tensor([0.25, 0.5, 0.75],
+                                device=_t.device).double())
+            print(f"[i]   {_r:<12} tau: median {_q[1]:.6g}  IQR [{_q[0]:.6g}, {_q[2]:.6g}]")
+    else:
+        print("[!] KHONG co Shrinkage-Adaptive (thieu --tau_diag hoac --tau_star).")
+        print("[!]  Moi rule chi duoc BAO CAO, chua duoc DUNG. Bat --tau_diag de kiem chung.")
 
     # baseline strength f(x) vs f(baseline) cho moi method (None neu pool nhieu diem)
     bl_str = {nm: baseline_strength(nm) for nm in methods}
@@ -450,7 +502,7 @@ def main():
             ncs, nss, gaps = [], [], []
             for i in range(X_eval.shape[0]):
                 x = X_eval[i]
-                phi = attr_for(nm, x)
+                phi = attr_for(nm, x, i=i)
                 r = soft_faith_tabular(model, x, phi, mu, target=target,
                                        score=args.score, n_samples=args.n_soft)
                 ncs.append(r["soft_nc"]); nss.append(r["soft_ns"]); gaps.append(r["soft_gap"])
@@ -481,7 +533,7 @@ def main():
                 ins, dels, gaps = [], [], []
                 for i in range(X_eval.shape[0]):
                     x = X_eval[i]
-                    phi = attr_for(nm, x, rng_seed=rs)
+                    phi = attr_for(nm, x, rng_seed=rs, i=i)
                     r = insertion_deletion_tabular(model, x, phi, imputer, steps=args.insdel_steps,
                                                    target=target, score=args.score, mode=args.insdel_mode,
                                                    X_pool=Xtr, gen=idg)

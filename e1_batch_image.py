@@ -262,13 +262,14 @@ def wilcoxon(a, b):
     return (W, z, p)
 
 
-def _print_summary_table(metric_names, acc, id_per_image, n_img, title):
+def _print_summary_table(metric_names, acc, id_per_image, n_img, title, bl_strength=None):
     win_count = {m: 0 for m in metric_names}
     for d in id_per_image:
         win_count[max(d, key=d.get)] += 1
     print(f"\n--- {title} (mean±SE tren {n_img} anh) ---")
-    print(f"{'method':<20}{'insertion↑':>16}{'deletion↓':>16}{'I-D↑':>16}{'win%':>8}")
-    print("-" * 76)
+    print(f"{'method':<20}{'insertion↑':>16}{'deletion↓':>16}{'I-D↑':>16}{'win%':>8}"
+          f"{'ratio':>9}{'|b-x|':>9}")
+    print("-" * 94)
     best_m, best_id = None, -float("inf")
     for m in metric_names:
         im, ise = mean_se(acc[m]["ins"])
@@ -277,8 +278,16 @@ def _print_summary_table(metric_names, acc, id_per_image, n_img, title):
         winp = 100.0 * win_count[m] / n_img if n_img else 0.0
         if idm > best_id:
             best_id, best_m = idm, m
-        print(f"{m:<20}{im:>8.4f}±{ise:<6.4f}{dm:>8.4f}±{dse:<6.4f}{idm:>8.4f}±{idse:<6.4f}{winp:>7.1f}%")
-    print("-" * 76)
+        # ratio f(base)/f(x) + shift |b-x| (neu co; EG khong co -> "-")
+        rtxt, stxt = "     -   ", "     -   "
+        if bl_strength and m in bl_strength:
+            d = bl_strength[m]
+            rr = [r for r in d["ratio"] if r == r]
+            if rr: rtxt = f"{sum(rr)/len(rr):>9.4f}"
+            if d["shift"]: stxt = f"{sum(d['shift'])/len(d['shift']):>9.4f}"
+        print(f"{m:<20}{im:>8.4f}±{ise:<6.4f}{dm:>8.4f}±{dse:<6.4f}{idm:>8.4f}±{idse:<6.4f}"
+              f"{winp:>7.1f}%{rtxt}{stxt}")
+    print("-" * 94)
     print(f"[i] dan dau I-D: {best_m} = {best_id:.4f}")
     return best_m
 
@@ -346,7 +355,7 @@ def main():
         best_m = max(img_ids, key=img_ids.get)
         print(f"[{ip+1}/{len(paths)}] {os.path.basename(path):<24} best={best_m} ({img_ids[best_m]:.3f})")
         if args.report_every > 0 and ((ip + 1) % args.report_every == 0 or ip + 1 == len(paths)):
-            _print_summary_table(metric_names, acc, id_per_image, ip + 1,
+            _print_summary_table(metric_names, acc, id_per_image, ip + 1, bl_strength=bl_strength,
                                  title=f"TICH LUY sau {ip+1} anh")
 
     n_img = len(id_per_image)
@@ -355,7 +364,7 @@ def main():
         win_count[max(d, key=d.get)] += 1
 
     print("\n" + "=" * 80)
-    best_overall = _print_summary_table(metric_names, acc, id_per_image, n_img,
+    best_overall = _print_summary_table(metric_names, acc, id_per_image, n_img, bl_strength=bl_strength,
                                         title=f"KET QUA CUOI CUNG tren {n_img} anh")
 
     # ---- DEBUG: bang baseline strength f(x) vs f(baseline), trung binh tren anh ----

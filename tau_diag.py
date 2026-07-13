@@ -15,7 +15,15 @@ CAC RULE DA THU VA DA HONG — ghi lai de khong ai lap lai:
           cham tran Δf ~ 0.838, tu so thanh HANG SO => SNR thoai hoa thanh
           1/||b-x||^2, tuc chi xep hang theo "ai gan x nhat". Vo nghia.
 
-  (3) tau tai (hoac ngay truoc) DIEM GAY cua Δf
+  (3) |b-x|/|x-mu| va amp = (f(b)-1/K)/(f(x)-1/K)
+      -> BO. Moi modality mot measure => bang cross-modality vo nghia, va luan diem
+      "portable" cua paper sup theo.
+      Cu the: o VISION, mu = anh xam trung binh ImageNet = TENSOR 0 trong khong gian
+      chuan hoa => ||x-mu|| = ||x||_2, chi la do lon cua chinh buc anh, KHONG mang
+      thong tin gi ve prior. Cot do vo nghia o day.
+      amp thi can K (so lop) — cung la mot tham so modality-specific.
+
+  (4) tau tai (hoac ngay truoc) DIEM GAY cua Δf
       -> dung o vision (@4/@8) va NLP (@1), nhung SAI o TABULAR.
       Ly do: rule gia dinh "sau gay la quang duong thua". O vision/NLP dung, vi
       ||b-x|| VAN TIEP TUC TANG sau gay. O tabular ||b-x|| BAO HOA CUNG LUC voi
@@ -45,7 +53,38 @@ Doi chieu voi LOG THAT (sai phan tren grid decade hien co):
            @10->@100: (0.731-0.629)/(0.651-0.640) = 9.27       <- VAN TANG
            => di tiep.         best that = @100                OK
 
-Ca ba modality khop. Do la ly do bo SNR va giu ti gia bien.
+Ket qua kiem tren so THAT (grid decade san co), eps = 0.05:
+
+  modality      best that   tau_rate
+  ---------------------------------------------------------------
+  VISION n=3    @8          @8        OK
+  VISION n=5    @4          @8        trong vung HOA (xem duoi)
+  NLP           @1          @1        OK
+  TABULAR       @100        @100      OK  + tu bao "GRID CUT DAU"
+
+VISION n=5: best la @4 (I-D 4.67) nhung @8 = 4.48, win% 40/40 HOA, SE +-0.58.
+Chenh 4%, khong tach duoc thong ke. Va o n=3 thi @8 LAI thang. Best that su o
+vision DAO DONG giua @4 va @8 theo n; rule on dinh chon @8 — nam trong vung hoa.
+KHONG giau: rule chua tach duoc @4 vs @8 o vision. Grid 4 diem qua tho, gay nhay
+giua cac lan chay -> DUNG dense sweep (--tau_diag --diag_n 30) de xac dinh.
+
+eps: 0.05 va 0.1 cho CUNG ket qua. eps=0.01 lam vision n=5 troi ra @16 (I-D 3.25,
+te nhat) vi ti gia chi tut 85 lan (< 100). Chon eps=0.05: on dinh.
+
+TI GIA BIEN la MOT METRIC DUY NHAT cho ca ba modality:
+  - KHONG can mu       (khac |b-x|/|x-mu|)
+  - KHONG can K        (khac amp)
+  - KHONG can biet D   (khac SNR)
+  - KHONG can biet san o dau, gay o dau
+Chi can HAI cot ma ca ba script deu da co: Δf va ||b-x||_2.
+
+BANG CHUAN (giong het nhau o ca ba modality):
+
+    method        f(x)     f(b)      Δf    |b-x|₂   d(Δf)/d|b-x|
+
+Voi hang CO DINH (black/mean/blur/IG2/EG) khong co ti gia bien (khong nam tren
+truc tau), nhung van doc duoc tren CUNG HAI COT dau: cung Δf, ai di xa hon.
+Khong can measure rieng — chi can doc bang.
 
 Ghi chu ve tabular: ti gia VAN TANG o cuoi grid => GRID CUT DAU. Rule tu phat
 hien duoc dieu do (bao [!!] khi tau_rate roi vao diem cuoi grid).
@@ -116,10 +155,13 @@ def _marginal_rate(delta_f: torch.Tensor, dist: torch.Tensor) -> torch.Tensor:
         return torch.zeros_like(delta_f)
     dd = delta_f[:, 1:] - delta_f[:, :-1]
     ds = (dist[:, 1:] - dist[:, :-1]).clamp_min(1e-12)   # quang duong tang don dieu theo tau
-    fwd = dd / ds                                        # (M, T-1)
-    r = torch.zeros_like(delta_f)
+    fwd = dd / ds                                        # (M, T-1): ti gia cua khoang [t, t+1]
+    r = torch.full_like(delta_f, float("nan"))
     r[:, :-1] = fwd
-    r[:, -1] = fwd[:, -1]
+    # DIEM CUOI: KHONG co khoang [T-1, T] => KHONG co ti gia. Truoc day copy ti gia cua
+    # khoang truoc vao day -> ti gia GIA. Voi vision n=5 no khien r[@16] = r[@8] = 4.3e-05
+    # vua du vuot nguong eps*rmax = 4.27e-05 => rule chon @16 (te nhat, I-D 3.25) thay vi @4.
+    # De NaN: khong co du lieu thi khong duoc doan.
     return r
 
 
@@ -128,15 +170,16 @@ def _marginal_rate(delta_f: torch.Tensor, dist: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def sweep_curve(X_eval, score_fn, baseline_fn, taus,
-                mu=None, ref_s=None, ref_V=None, ref_mu=None, n_class=None):
+                mu=None, ref_s=None, ref_V=None, ref_mu=None):
     """
     X_eval    : (M, ...)
     score_fn  : (B,...) -> (B,)  xac suat lop target
     baseline_fn: (x_single, tau) -> baseline
     taus      : list[float], NEN dense (>= 25 diem)
-    n_class   : de tinh 'amp' = bien do con lai so voi san 1/K (scale-free theo K)
+    mu        : chi dung de canh bao f(mu) > f(x). KHONG dung de chuan hoa quang duong.
+    ref_*     : chi dung cho Mahalanobis (kiem tra P2). Khong bat buoc.
 
-    Tra ve dict: (M,T) rho, delta_f, dist, rate, dist_norm, amp, maha_b
+    Tra ve dict: (M,T) rho, delta_f, dist, rate, maha_b
                  (M,)  f_x, f_mu, maha_x, valid
     """
     M, T = X_eval.shape[0], len(taus)
@@ -153,8 +196,6 @@ def sweep_curve(X_eval, score_fn, baseline_fn, taus,
         return ((c ** 2) / ref_s.clamp_min(1e-12)[None]).sum(1).sqrt()
 
     maha_x = _maha(X_eval) if have_ref else torch.full((M,), float("nan"), device=dev)
-    d_mu = ((X_eval.reshape(M, -1) - mu.reshape(1, -1)).norm(dim=1).clamp_min(1e-12)
-            if mu is not None else torch.ones(M, device=dev))
 
     rho = torch.zeros(M, T, device=dev)
     dist = torch.zeros(M, T, device=dev)
@@ -168,20 +209,13 @@ def sweep_curve(X_eval, score_fn, baseline_fn, taus,
             maha_b[:, t_i] = _maha(B)
 
     delta_f = f_x[:, None] * (1.0 - rho)                 # = f(x) - f(b): ngan sach Completeness
-    rate = _marginal_rate(delta_f, dist)                 # <-- DAI LUONG CHINH
-    dist_norm = dist / d_mu[:, None]                     # 1.0 = da toi mu; >1 = di QUA mu
-
-    if n_class:
-        fl = 1.0 / n_class
-        amp = (((rho * f_x[:, None]) - fl) / (f_x[:, None] - fl).clamp_min(1e-12)).clamp(0, 1)
-    else:
-        amp = torch.full_like(rho, float("nan"))
+    rate = _marginal_rate(delta_f, dist)                 # <-- DAI LUONG DUY NHAT CAN
 
     valid = _validate(f_x, f_mu, M, mu is not None)
     return {"taus": torch.tensor(taus, device=dev),
             "rho": rho, "delta_f": delta_f, "dist": dist, "rate": rate,
-            "dist_norm": dist_norm, "amp": amp, "maha_b": maha_b,
-            "f_x": f_x, "f_mu": f_mu, "maha_x": maha_x, "valid": valid}
+            "maha_b": maha_b, "f_x": f_x, "f_mu": f_mu,
+            "maha_x": maha_x, "valid": valid}
 
 
 def _validate(f_x, f_mu, M, have_mu):
@@ -210,7 +244,7 @@ def _validate(f_x, f_mu, M, have_mu):
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def sweep_curve_varlen(examples, score_one, embed_of, baseline_one, taus,
-                       mu_baseline=None, maha_one=None, mask_one=None, n_class=None):
+                       mu_baseline=None, maha_one=None, mask_one=None):
     """
     Giong sweep_curve nhung loop tung example.
     dist = ||.||_2 tren cac coordinate DUOC GIU (mask_one), KHONG phai .abs().mean()
@@ -220,7 +254,7 @@ def sweep_curve_varlen(examples, score_one, embed_of, baseline_one, taus,
     rho = torch.zeros(M, T); dist = torch.zeros(M, T)
     maha_b = torch.full((M, T), float("nan"))
     f_x = torch.zeros(M); f_mu = torch.full((M,), float("nan"))
-    maha_x = torch.full((M,), float("nan")); d_mu = torch.ones(M)
+    maha_x = torch.full((M,), float("nan"))
 
     def _sub(t, m):
         return (t[0][m] if (m is not None and t.dim() == 3) else t).reshape(-1)
@@ -232,9 +266,7 @@ def sweep_curve_varlen(examples, score_one, embed_of, baseline_one, taus,
         if maha_one is not None:
             maha_x[i] = float(maha_one(it, x))
         if mu_baseline is not None:
-            bmu = mu_baseline(it)
-            f_mu[i] = float(score_one(it, bmu))
-            d_mu[i] = max(_sub(x - bmu, m).norm().item(), 1e-12)
+            f_mu[i] = float(score_one(it, mu_baseline(it)))
         for t_i, tau in enumerate(taus):
             b = baseline_one(it, x, tau)
             rho[i, t_i] = float(score_one(it, b)) / f_x[i]
@@ -244,32 +276,31 @@ def sweep_curve_varlen(examples, score_one, embed_of, baseline_one, taus,
 
     delta_f = f_x[:, None] * (1.0 - rho)
     rate = _marginal_rate(delta_f, dist)
-    dist_norm = dist / d_mu[:, None]
-    if n_class:
-        fl = 1.0 / n_class
-        amp = (((rho * f_x[:, None]) - fl) / (f_x[:, None] - fl).clamp_min(1e-12)).clamp(0, 1)
-    else:
-        amp = torch.full_like(rho, float("nan"))
 
     valid = _validate(f_x, f_mu, M, mu_baseline is not None)
     return {"taus": torch.tensor([float(t) for t in taus]),
             "rho": rho, "delta_f": delta_f, "dist": dist, "rate": rate,
-            "dist_norm": dist_norm, "amp": amp, "maha_b": maha_b,
-            "f_x": f_x, "f_mu": f_mu, "maha_x": maha_x, "valid": valid}
+            "maha_b": maha_b, "f_x": f_x, "f_mu": f_mu,
+            "maha_x": maha_x, "valid": valid}
 
 
 # ---------------------------------------------------------------------------
 # Selection rules
 # ---------------------------------------------------------------------------
-def selection_rules(curve: dict, eps: float = 0.01):
+def selection_rules(curve: dict, eps: float = 0.05):
     """
     Tra ve (rules, valid).
 
     tau_rate  : *** RULE CHINH ***
                 tau LON NHAT ma ti gia bien r(tau) >= eps * max_t r(t).
                 "Di tiep chung nao con mua duoc du tin hieu tren moi don vi duong."
-                eps la nguong TUONG DOI (1% ti gia cuc dai) — no chi noi "ti gia
-                da tut 100 lan", khong phai mot hang so tuyet doi phai tune.
+                eps la nguong TUONG DOI: "ti gia da tut 1/eps lan thi dung".
+
+                eps = 0.05 (tut 20 lan). KHONG phai 0.01:
+                  vision n=5: ti gia @4->@8 = 0.00367, @8->@16 = 4.3e-05 => tut 85 lan.
+                  Voi eps=0.01 (doi tut 100 lan) thi 85 < 100 => KHONG dung => chon @16,
+                  la baseline TE NHAT (I-D 3.25) thay vi @4 (4.67). eps=0.01 qua LONG.
+                  Voi eps=0.05: nguong = 0.05*0.00427 = 2.1e-04 > 4.3e-05 => dung o @8. Dung.
                   vision : ti gia sap 1000x sau @8   -> dung @8
                   NLP    : ti gia AM sau @1          -> dung @1
                   tabular: ti gia VAN TANG tai @100  -> di tiep (grid cut dau)
@@ -279,8 +310,7 @@ def selection_rules(curve: dict, eps: float = 0.01):
                 SAI o tabular (chon @1, best la @100). Giu lai de THAY RO no sai,
                 chu khong phai de dung.
 
-    tau_amp   : DOI CHUNG. tau nho nhat con <=10% bien do ban dau so voi san 1/K.
-                Scale-free theo K (chay ca K=2 lan K=1000) nhung VAN co tham so.
+    (Da bo tau_amp: no can K => modality-specific => bang cross-modality vo nghia.)
     """
     taus, dev = curve["taus"], curve["taus"].device
     M, T = curve["rho"].shape
@@ -289,22 +319,27 @@ def selection_rules(curve: dict, eps: float = 0.01):
     out = {}
 
     # --- tau_rate (CHINH) ---
-    # CAN THAN OFF-BY-ONE: rate[t] la ti gia cua KHOANG [t, t+1], khong phai cua
-    # DIEM t. Nen "khoang cuoi cung con tot" la [t*, t*+1], va tau can chon la
-    # DIEM CUOI cua khoang do, tuc t*+1 — khong phai t*.
+    # rate co T diem nhung chi T-1 KHOANG co nghia: rate[:, j] = ti gia cua khoang
+    # [j, j+1], j = 0..T-2. rate[:, T-1] la NaN (khong co khoang sau no).
     #
-    # Ban dau lay t* -> TRUOT MOT BUOC o NLP: chon @0.1 trong khi best la @1.
-    # Ly do: rate[@1] = -0.089 mo ta doan @1->@10 (xau), nhung DEN duoc @1 thi
-    # van tot (rate[@0.1] = +0.162). Loai @1 la sai — no bi loai vi doan SAU no
-    # xau, chu khong phai vi den no la xau.
+    # Rule: tim KHOANG TOT CUOI CUNG j*, roi chon tau tai DIEM CUOI cua khoang do,
+    # tuc tau[j*+1]. Neu KHONG khoang nao tot (ti gia am ngay tu dau) -> tau[0].
     #
-    # Sau khi +1:  vision @4->@8 (OK), NLP @0.1->@1 (OK), tabular @100 (clamp, OK).
-    rmax = rate.clamp_min(0).max(dim=1, keepdim=True).values.clamp_min(1e-12)
-    ok = rate >= eps * rmax                                       # (M,T) khoang [t,t+1] con dang di
-    ar = torch.arange(T, device=dev, dtype=torch.float)[None]
-    idx_last = (ok.float() * ar).argmax(dim=1)                    # khoang tot cuoi cung
-    idx_last = torch.where(ok.any(1), idx_last, torch.zeros_like(idx_last))
-    idx_star = (idx_last + 1).clamp_max(T - 1)                    # DIEM CUOI cua khoang do
+    # LICH SU HAI LOI DA MAC O DAY:
+    #  (a) Gan ti gia cua khoang cuoi cho ca DIEM cuoi (rate[T-1] = rate[T-2]).
+    #      -> ti gia GIA. Vision n=5: rate[@16] = rate[@8] = 4.3e-05, vua du vuot
+    #      nguong => chon @16 (te nhat, I-D 3.25) thay vi @4 (4.67).
+    #  (b) Chon tau[j*] thay vi tau[j*+1] (off-by-one).
+    #      -> NLP: chon @0.1 trong khi best la @1. Ly do: rate[@1] = -0.089 mo ta
+    #      doan @1->@10 (xau), nhung DEN duoc @1 thi van tot. Loai @1 la sai — no
+    #      bi loai vi doan SAU no xau, chu khong phai vi den no la xau.
+    r_int = rate[:, :T - 1]                                       # (M, T-1) chi cac khoang that
+    rmax = r_int.clamp_min(0).max(dim=1, keepdim=True).values.clamp_min(1e-12)
+    ok = r_int >= eps * rmax                                      # khoang [j,j+1] con dang di
+    ar = torch.arange(T - 1, device=dev, dtype=torch.float)[None]
+    j_star = (ok.float() * ar).argmax(dim=1)                      # khoang tot cuoi cung
+    has = ok.any(1)
+    idx_star = torch.where(has, j_star + 1, torch.zeros_like(j_star))   # DIEM CUOI cua khoang do
     out["tau_rate"] = taus[idx_star]
     at_edge = float((idx_star[valid] == T - 1).float().mean().item()) if int(valid.sum()) else 0.0
 
@@ -317,13 +352,6 @@ def selection_rules(curve: dict, eps: float = 0.01):
         yy = (y - y.min()); yy = yy / yy.max().clamp_min(1e-12)
         idx.append(int((yy - xx).argmax().item()))                # Kneedle cho duong TANG
     out["tau_knee"] = taus[torch.tensor(idx, device=dev)]
-
-    # --- tau_amp (doi chung) ---
-    if not torch.isnan(curve["amp"]).all():
-        hit = curve["amp"] <= 0.10
-        first = torch.where(hit.any(1), hit.float().argmax(1),
-                            torch.full((M,), T - 1, device=dev, dtype=torch.long))
-        out["tau_amp"] = taus[first]
 
     out["_at_edge"] = at_edge
     return out, valid
@@ -351,24 +379,19 @@ def print_curve_table(curve: dict, tag: str = ""):
     if not torch.isnan(curve["f_mu"]).all():
         print(f"[i] f(mu) = {curve['f_mu'].mean():.4f}   (san ma f(b) tien toi khi tau -> inf)")
     print()
-    print(f"{'tau':>10}{'f(b)':>9}{'Δf':>9}{'|b-x|₂':>10}{'|b-x|/|x-mu|':>14}"
-          f"{'amp':>8}{'d(Δf)/d|b-x|':>15}")
-    print("-" * 76)
+    print(f"{'tau':>10}{'f(b)':>9}{'Δf':>9}{'|b-x|₂':>10}{'d(Δf)/d|b-x|':>16}")
+    print("-" * 55)
     for i, t in enumerate(taus):
         fb = (curve["rho"][:, i] * fx).mean().item()
         df_ = curve["delta_f"][:, i].mean().item()
         d_ = curve["dist"][:, i].mean().item()
-        dn_ = curve["dist_norm"][:, i].mean().item()
         r_ = curve["rate"][:, i].mean().item()
-        a = curve["amp"][:, i]
-        a_s = f"{a.mean().item():>8.3f}" if not torch.isnan(a).all() else f"{'-':>8}"
-        print(f"{t:>10.4g}{fb:>9.4f}{df_:>9.4f}{d_:>10.4f}{dn_:>14.3f}{a_s}{r_:>15.5g}")
-    print("-" * 76)
+        print(f"{t:>10.4g}{fb:>9.4f}{df_:>9.4f}{d_:>10.4f}{r_:>16.5g}")
+    print("-" * 55)
+    print("[i] Δf = f(x)-f(b) = NGAN SACH COMPLETENESS (= sum_i phi_i).")
     print("[i] d(Δf)/d|b-x| = TI GIA BIEN: di them 1 don vi quang duong -> mua duoc bao nhieu tin hieu.")
-    print("[i]   Dung khi ti gia tut. KHONG chia cho |b-x|² (do la SNR — hong o D lon: mau so ~1e4,")
-    print("[i]   tu so <=1, in ra toan 0.0000; va Δf cham tran => SNR thanh 1/|b-x|², vo nghia).")
-    print("[i] |b-x|/|x-mu| : 1.0 = da toi mu. >1 = di QUA mu (zero/black o vision ~2.0).")
-    print("[i] amp = (f(b)-1/K)/(f(x)-1/K) : bien do con lai so voi san uniform. Scale-free theo K.")
+    print("[i]   MOT metric duy nhat cho ca 3 modality: khong can mu, khong can K, khong can D.")
+    print("[i]   Dung khi ti gia tut => tau_rate. Xem bang rules ben duoi.")
 
 
 def print_rules_table(rules: dict, oracle=None, valid=None):
@@ -390,7 +413,7 @@ def print_rules_table(rules: dict, oracle=None, valid=None):
         qq = torch.quantile(oracle.double().cpu(), q3)
         print(f"{'ORACLE(I-D)':<12}{qq[1]:>11.4g}{oracle.mean():>11.4g}   [{qq[0]:.4g}, {qq[2]:.4g}]")
     print("-" * 74)
-    print("[i] tau_rate = RULE CHINH (ti gia bien). tau_knee / tau_amp = DOI CHUNG.")
+    print("[i] tau_rate = RULE CHINH (ti gia bien). tau_knee = DOI CHUNG.")
     print("[i] tau_knee SAI o tabular: no chon diem gay, nhung o tabular ||b-x|| bao hoa CUNG LUC")
     print("[i]   voi Δf (ca hai hoi tu khi b->mu) => khong co quang duong thua => khong co ly do")
     print("[i]   dung o gay. Best that = cuoi grid (@100). Giu tau_knee de THAY RO no sai.")
@@ -410,8 +433,8 @@ def dump_curve_csv(curve: dict, path: str, extra_cols: dict | None = None):
     """
     taus = curve["taus"].tolist()
     M, T = curve["rho"].shape
-    cols = ["i", "tau", "f_x", "f_b", "rho", "delta_f", "dist", "dist_norm",
-            "amp", "rate", "maha_x", "maha_b", "valid"]
+    cols = ["i", "tau", "f_x", "f_b", "delta_f", "dist", "rate",
+            "maha_x", "maha_b", "valid"]
     if extra_cols:
         cols += list(extra_cols.keys())
     with open(path, "w", newline="") as fh:
@@ -422,11 +445,8 @@ def dump_curve_csv(curve: dict, path: str, extra_cols: dict | None = None):
             for t in range(T):
                 row = {"i": i, "tau": taus[t], "f_x": fx,
                        "f_b": fx * curve["rho"][i, t].item(),
-                       "rho": curve["rho"][i, t].item(),
                        "delta_f": curve["delta_f"][i, t].item(),
                        "dist": curve["dist"][i, t].item(),
-                       "dist_norm": curve["dist_norm"][i, t].item(),
-                       "amp": curve["amp"][i, t].item(),
                        "rate": curve["rate"][i, t].item(),
                        "maha_x": curve["maha_x"][i].item(),
                        "maha_b": curve["maha_b"][i, t].item(),
@@ -442,8 +462,7 @@ def dump_curve_csv(curve: dict, path: str, extra_cols: dict | None = None):
 # Baseline CO DINH (zero/mean/blur/MaxEnt/IG2...) — xep len CUNG TRUC
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def fixed_baseline_diag(X_eval, score_fn, b_fn, mu=None,
-                        ref_s=None, ref_V=None, ref_mu=None, n_class=None):
+def fixed_baseline_diag(X_eval, score_fn, b_fn, ref_s=None, ref_V=None, ref_mu=None):
     """
     Cung don vi voi sweep_curve, de tra loi: "IG-zero nam o dau tren truc tau?"
 
@@ -457,13 +476,7 @@ def fixed_baseline_diag(X_eval, score_fn, b_fn, mu=None,
     B = torch.stack([b_fn(X_eval[i]) for i in range(M)], 0)
     f_b = score_fn(B)
     dist = (X_eval - B).reshape(M, -1).norm(dim=1)
-    out = {"f_x": f_x, "f_b": f_b, "rho": f_b / f_x, "delta_f": f_x - f_b, "dist": dist}
-    if mu is not None:
-        d_mu = (X_eval.reshape(M, -1) - mu.reshape(1, -1)).norm(dim=1).clamp_min(1e-12)
-        out["dist_norm"] = dist / d_mu
-    if n_class:
-        fl = 1.0 / n_class
-        out["amp"] = ((f_b - fl) / (f_x - fl).clamp_min(1e-12)).clamp(0, 1)
+    out = {"f_x": f_x, "f_b": f_b, "delta_f": f_x - f_b, "dist": dist}
     if ref_s is not None:
         def mh(Z):
             c = (Z.reshape(Z.shape[0], -1) - ref_mu.reshape(1, -1)) @ ref_V
@@ -474,9 +487,14 @@ def fixed_baseline_diag(X_eval, score_fn, b_fn, mu=None,
 
 
 def print_fixed_header():
+    """
+    Hang CO DINH (black/mean/blur/IG2/EG) khong nam tren truc tau => KHONG co ti gia
+    bien. Nhung doc duoc tren CUNG HAI COT Δf va |b-x|₂: cung Δf, ai di xa hon.
+    Khong can measure rieng cho chung.
+    """
     print(f"\n{'fixed baseline':<20}{'f(b)':>9}{'Δf':>9}{'|b-x|₂':>10}"
-          f"{'|b-x|/|x-mu|':>14}{'amp':>8}{'|b-mu|_S⁻¹':>13}{'P2':>7}")
-    print("-" * 90)
+          f"{'|b-mu|_S⁻¹':>13}{'P2':>7}")
+    print("-" * 66)
 
 
 def print_fixed_row(name: str, d: dict):
@@ -491,4 +509,4 @@ def print_fixed_row(name: str, d: dict):
 
     p2 = f"{d['P2_ok'].mean().item()*100:>6.0f}%" if "P2_ok" in d else f"{'-':>7}"
     print(f"{name:<20}{f(g('f_b'),9)}{f(g('delta_f'),9)}{f(g('dist'),10)}"
-          f"{f(g('dist_norm'),14,3)}{f(g('amp'),8,3)}{f(g('maha_b'),13)}{p2}")
+          f"{f(g('maha_b'),13)}{p2}")

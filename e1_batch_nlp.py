@@ -387,28 +387,27 @@ def main():
             mu_baseline=lambda it: mu.view(1, 1, -1).expand(1, it["we"].shape[1], -1).contiguous(),
             maha_one=_maha_one,
             mask_one=lambda it: it["keep"],
-            n_class=n_class_nlp,
         )
         tau_diag.print_curve_table(curve, tag=f"[nlp/{args.model}/{args.dataset}]")
 
         # cac baseline CO DINH, cung don vi -> tra loi cau hoi zero co vi pham (P2) khong
-        print(f"\n{'fixed baseline':<20}{'f(b)':>10}{'Δf':>10}{'|b-x|₂':>10}"
-              f"{'|b-mu|_S⁻¹':>13}{'P2 ok':>9}")
-        print("-" * 74)
+        print(f"\n{'fixed baseline':<20}{'f(x)':>9}{'f(b)':>9}{'Δf':>10}{'|b-x|₂':>11}"
+              f"{'|b-mu|_S⁻¹':>13}{'P2':>7}")
+        print("-" * 80)
         maha_x_mean = curve["maha_x"].mean().item()
         for nm in ["IG-zero", "IG-pad", "IG-mask", "IG-mean", "IG-random"]:
-            fbs, dds, shs, mms, p2 = [], [], [], [], []
+            fxs, fbs, dds, shs, mms, p2 = [], [], [], [], [], []
             for it in exs:
                 x = it["we"]
                 b = baseline_embed_for(nm, x)
                 fx = _score_one(it, x); fb = _score_one(it, b)
                 sh = ((x - b)[0][it["keep"]] if it["keep"].any() else (x - b)).reshape(-1).norm().item()
                 mb = _maha_one(it, b); mx = _maha_one(it, x)
-                fbs.append(fb); dds.append(fx - fb); shs.append(sh)
+                fxs.append(fx); fbs.append(fb); dds.append(fx - fb); shs.append(sh)
                 mms.append(mb); p2.append(1.0 if mb <= mx else 0.0)
             n_ = len(fbs)
-            print(f"{nm:<20}{sum(fbs)/n_:>10.4f}{sum(dds)/n_:>10.4f}{sum(shs)/n_:>10.4f}"
-                  f"{sum(mms)/n_:>13.4f}{sum(p2)/n_*100:>8.0f}%")
+            print(f"{nm:<20}{sum(fxs)/n_:>9.4f}{sum(fbs)/n_:>9.4f}{sum(dds)/n_:>10.4f}"
+                  f"{sum(shs)/n_:>11.4f}{sum(mms)/n_:>13.4f}{sum(p2)/n_*100:>6.0f}%")
         print(f"[i] |x-mu|_S-1 = {maha_x_mean:.4f}  (Mahalanobis cua chinh input)")
         print("[i] Neu IG-zero P2 ok% CAO => zero KHONG vi pham (P2) o embedding space")
         print("[i] => Table 1 hang 'zero ✗' SAI cho NLP, va viec zero THANG khong con la nghich ly.")
@@ -584,8 +583,8 @@ def main():
                               for nc, ns in zip(acc[m]["soft_nc"], acc[m]["soft_ns"])]
     print(f"\n{'='*116}\nKET QUA E1-NLP tren {n} cau  ({args.model}/{args.dataset})")
     print(f"{'method':<20}{'Soft-NC↑':>15}{'Soft-NS↑':>15}{'Soft-gap↑':>15}{'Soft-logodds↑':>18}"
-          f"{'f(x)':>8}{'f(b)':>8}{'ratio':>8}{'|b-x|₂':>9}{'Δf':>9}")
-    print("-" * 125)
+          f"{'f(x)':>8}{'f(b)':>8}{'Δf':>9}{'|b-x|₂':>10}")
+    print("-" * 118)
     # best theo Soft-gap (tinh truoc de danh dau)
     gap_means = {m: mean_se(acc[m]["soft_gap"])[0] for m in methods}
     best_m = max(gap_means, key=gap_means.get)
@@ -597,21 +596,19 @@ def main():
         gp_m, gp_se = mean_se(acc[m]["soft_gap"])
         lo_m, lo_se = mean_se(acc[m]["soft_logodds"])
         # f(x)/f(xt)/ratio/|b-x| (EG khong co baseline diem -> "-")
-        fx, fxt, rtxt, stxt = "   -  ", "   -  ", "   -  ", "    -   "
-        dftxt = "    -   "
+        # BON cot, giong het ca ba modality: f(x) f(b) Δf |b-x|₂
+        # (bo 'ratio': no bo mat f(x); Δf da co f(x) ben trong)
+        fx, fxt, dftxt, stxt = "   -  ", "   -  ", "    -   ", "     -    "
         if m in bl_strength:
             d = bl_strength[m]
             if d["pf"]:   fx  = f"{sum(d['pf'])/len(d['pf']):>6.4f}"
             if d["pb"]:   fxt = f"{sum(d['pb'])/len(d['pb']):>6.4f}"
-            rr = [r for r in d["ratio"] if r == r]
-            if rr:        rtxt = f"{sum(rr)/len(rr):>6.4f}"
-            if d["shift"]:stxt = f"{sum(d['shift'])/len(d['shift']):>8.4f}"
-            # Δf = f(x)-f(b) = ngan sach Completeness (co f(x) ben trong, ratio thi khong)
             if d["df"]:   dftxt = f"{sum(d['df'])/len(d['df']):>8.4f}"
+            if d["shift"]:stxt = f"{sum(d['shift'])/len(d['shift']):>9.4f}"
         mark = "  <-- best" if m == best_m else ""
         print(f"{m:<20}{nc_m:>8.4f}±{nc_se:<5.4f}{ns_m:>8.4f}±{ns_se:<5.4f}"
               f"{gp_m:>8.4f}±{gp_se:<5.4f}{lo_m:>10.4f}±{lo_se:<6.4f}"
-              f"{fx:>8}{fxt:>8}{rtxt:>8}{stxt:>9}{dftxt:>9}{mark}")
+              f"{fx:>8}{fxt:>8}{dftxt:>9}{stxt:>10}{mark}")
         summary_rows.append({"method": m, "n": n,
                              "soft_nc_mean": nc_m, "soft_nc_se": nc_se,
                              "soft_ns_mean": ns_m, "soft_ns_se": ns_se,

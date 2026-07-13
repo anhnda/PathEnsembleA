@@ -145,26 +145,29 @@ def train_classifier(Xtr, ytr, n_class, args, device):
 
 def _fmt_strength(s):
     """
-    s = dict tu fixed_baseline_diag hoac None.
-    In: f(x) f(b) ratio |b-x|₂ Δf |b-x|/|x-mu| amp P2%
+    BON cot, GIONG HET nhau o ca ba modality:  f(x)  f(b)  Δf  |b-x|₂   (+P2)
 
-    Δf = f(x)-f(b) = NGAN SACH COMPLETENESS (co f(x) ben trong; ratio thi khong).
-    |b-x|/|x-mu| = quang duong chuan hoa: 1.0 = da toi mu, >1 = di QUA mu.
-    amp = bien do con lai so voi san 1/K.
+    Δf = f(x) - f(b) = NGAN SACH COMPLETENESS (= sum_i phi_i).
+    |b-x|₂ = QUANG DUONG (L2, khong phai .abs().mean() = L1/D nhu code cu).
 
-    (BO cot SNR = Δf/|b-x|² — da chung minh HONG: o vision D=150k thi mau so ~1e4,
-     tu so <=1, in ra toan 0.0000; va moi baseline manh deu cham tran Δf nen tu so
-     thanh hang so => SNR thoai hoa thanh 1/|b-x|². Thay bang TI GIA BIEN o bang
-     tau-diagnostic.)
+    Hai cot nay du de doc moi thu: cung Δf, ai di xa hon thi te hon.
+    Ti gia bien d(Δf)/d|b-x| chi tinh duoc giua cac hang CUNG TRUC tau
+    -> in o bang --tau_diag.
+
+    DA BO:
+      ratio = f(b)/f(x)      -> bo mat f(x). Δf da co f(x) ben trong.
+      SNR   = Δf/|b-x|²      -> hong o D lon (vision: mau so ~1e4, in ra 0.0000).
+      |b-x|/|x-mu|           -> o vision mu = TENSOR 0 => ||x-mu|| = ||x||, vo nghia.
+      amp                    -> can K => modality-specific.
+    Moi modality mot measure thi bang cross-modality vo nghia.
     """
     if s is None:
-        return f"{'-':>8}{'-':>8}{'-':>8}{'-':>9}{'-':>9}{'-':>8}{'-':>7}{'-':>6}"
+        return f"{'-':>8}{'-':>8}{'-':>9}{'-':>10}{'-':>6}"
     g = lambda k: (s[k].mean().item() if k in s else float("nan"))
     f = lambda v, w, p=4: (f"{v:>{w}.{p}f}" if v == v else f"{'-':>{w}}")
     p2 = s["P2_ok"].mean().item() * 100 if "P2_ok" in s else float("nan")
     p2s = f"{p2:>5.0f}%" if p2 == p2 else f"{'-':>6}"
-    return (f(g("f_x"),8) + f(g("f_b"),8) + f(g("rho"),8) + f(g("dist"),9)
-            + f(g("delta_f"),9) + f(g("dist_norm"),8,3) + f(g("amp"),7,3) + p2s)
+    return f(g("f_x"),8) + f(g("f_b"),8) + f(g("delta_f"),9) + f(g("dist"),10) + p2s
 
 
 def main():
@@ -291,7 +294,7 @@ def main():
             dist  = ||b-x||_2   (SUA: truoc day la (b-x).abs().mean() = L1/D,
                                  KHONG phai quang duong Euclid, dung cho SNR la sai)
             dist2 = ||b-x||_2^2 <- meo mo IG ~ O(L * dist2), khong phu thuoc f(x)
-            dist_norm = |b-x|/|x-mu|   (1.0 = da toi mu, >1 = di QUA mu)
+            (khong co dist_norm/amp: chung modality-specific, xem tau_diag.py)
             maha_b, P2_ok       <- kiem tra (P2) contraction cho tung baseline
         """
         if baseline_vec_for(name, X_eval[0]) is None:
@@ -300,7 +303,7 @@ def main():
             X_eval,
             lambda Z: score_target(model, Z, target=target, score="softmax"),
             lambda x: baseline_vec_for(name, x),
-            mu=mu, ref_s=ref.s, ref_V=ref.V, ref_mu=ref.mu, n_class=n_class,
+            ref_s=ref.s, ref_V=ref.V, ref_mu=ref.mu,
         )
 
     methods = ["IG-zero", "IG-mean", "IG-median", "IG-random"]
@@ -350,7 +353,6 @@ def main():
             X_eval, score_fn,
             lambda x, t: shrinkage_baseline(x, ref, tau=t),
             taus_d, mu=mu, ref_s=ref.s, ref_V=ref.V, ref_mu=ref.mu,
-            n_class=n_class,
         )
         tau_diag.print_curve_table(curve, tag=f"[tabular/{args.dataset}]")
 
@@ -397,9 +399,9 @@ def main():
     table, gaps_by_method = {}, {}
     if args.metric == "soft":
         print(f"{'method':<20}{'Soft-NC↑':>12}{'Soft-NS↑':>12}{'Soft-gap↑':>12}"
-              f"{'f(x)':>8}{'f(b)':>8}{'ratio':>8}{'|b-x|₂':>9}{'Δf':>9}{'|b-x|/|x-μ|':>8}{'amp':>7}{'P2':>6}"
+              f"{'f(x)':>8}{'f(b)':>8}{'Δf':>9}{'|b-x|₂':>10}{'P2':>6}"
               f"{'  (gap±SE)'}")
-        print("-" * 118)
+        print("-" * 101)
         for nm in methods:
             ncs, nss, gaps = [], [], []
             for i in range(X_eval.shape[0]):
@@ -420,9 +422,9 @@ def main():
                   f"{table[nm]['id_gap']:>12.4f}{scol}   ± {se:.4f}")
     else:
         print(f"{'method':<20}{'insertion↑':>12}{'deletion↓':>12}{'I-D↑':>10}"
-              f"{'f(x)':>8}{'f(b)':>8}{'ratio':>8}{'|b-x|₂':>9}{'Δf':>9}{'|b-x|/|x-μ|':>8}{'amp':>7}{'P2':>6}"
+              f"{'f(x)':>8}{'f(b)':>8}{'Δf':>9}{'|b-x|₂':>10}{'P2':>6}"
               f"{'  (mean±SE[±seed-std])'}")
-        print("-" * 122)
+        print("-" * 105)
         idg = torch.Generator(device="cpu"); idg.manual_seed(args.seed + 7)   # boc marginal
         for nm in methods:
             seeds = list(range(args.rand_seeds)) if is_stochastic(nm) else [None]

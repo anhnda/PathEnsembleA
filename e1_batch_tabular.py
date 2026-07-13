@@ -45,6 +45,10 @@ from synthetic_e0 import (
     make_tabular_gradfn, fit_imputer, insertion_deletion_tabular,
     soft_faith_tabular, _bootstrap_se,
 )
+from pea.baselines_rival import (
+    mlp_penultimate, ig2_tabular, sample_cf_ref_tabular,
+    max_entropy_baseline_tab, ig_from_baseline_tab, fringe_tabular,
+)
 
 
 DATASETS = {
@@ -64,6 +68,10 @@ def parse_args():
     ap.add_argument("--eg_K", type=int, nargs="+", default=[1, 4, 16, 64])
     ap.add_argument("--ppca_q", type=int, default=5, help="rank q cho PM-IG-PPCA")
     ap.add_argument("--floor", type=float, default=1e-6, help="ridge floor lambda cho Sigma")
+    # --- doi trong: IG2 / Max-Entropy / FRInGe ---
+    ap.add_argument("--rivals", action="store_true", help="bat IG2 / Max-Entropy / FRInGe")
+    ap.add_argument("--ig2_steps", type=int, default=40)
+    ap.add_argument("--me_steps", type=int, default=100)
     ap.add_argument("--test_size", type=float, default=0.3)
     ap.add_argument("--limit", type=int, default=None, help="chi danh gia N mau test dau")
     ap.add_argument("--metric", type=str, default="insdel", choices=["insdel", "soft"],
@@ -171,6 +179,14 @@ def main():
 
     N = args.N
 
+    # --- doi trong: rep layer + CF pool + n_class ---
+    rep_fn = mlp_penultimate(model) if args.rivals else None
+    cf_pool = Xtr if args.rivals else None
+    n_class = model.n_out if hasattr(model, "n_out") else 2
+    if args.rivals:
+        print(f"[i] RIVALS bat: IG2 (ig2_steps={args.ig2_steps}) / MaxEnt / FRInGe "
+              f"(me_steps={args.me_steps})")
+
     def rand_pool_for(rng_seed):
         gg = torch.Generator(device="cpu"); gg.manual_seed(rng_seed)
         idx = torch.randperm(Xtr.shape[0], generator=gg)[:max(args.eg_K)]
@@ -192,6 +208,17 @@ def main():
             return ig_tabular(x, shrinkage_baseline(x, ref, tau=tau), grad_fn, T=N)
         if name == "PM-IG-PPCA":
             return ig_tabular(x, shrinkage_baseline(x, ppca_ref, tau=psi), grad_fn, T=N)
+        # --- doi trong ---
+        if name == "IG-MaxEnt":
+            b = max_entropy_baseline_tab(model, x, n_class, steps=args.me_steps)
+            return ig_from_baseline_tab(model, x, b, target, T=N, score=args.score)
+        if name == "FRInGe":
+            return fringe_tabular(model, x, target, n_class, steps=N,
+                                  me_steps=args.me_steps, score=args.score)
+        if name == "IG2":
+            xr = sample_cf_ref_tabular(model, x, target, cf_pool, score=args.score)
+            return ig2_tabular(model, x, xr, target, rep_fn,
+                               steps=args.ig2_steps, score=args.score)
         raise ValueError(name)
 
     def is_stochastic(name):
@@ -206,6 +233,24 @@ def main():
             return shrinkage_baseline(x, ref, tau=float(name.split("@")[1]))
         if name == "PM-IG-PPCA":
             return shrinkage_baseline(x, ppca_ref, tau=psi)
+        # --- doi trong: baseline DIEM (de debug strength) ---
+        if name == "IG-MaxEnt":
+            return max_entropy_baseline_tab(model, x, n_class, steps=args.me_steps)
+        if name == "FRInGe":
+            return max_entropy_baseline_tab(model, x, n_class, steps=args.me_steps)  # ref cua FRInGe
+        if name == "IG2":
+            xr = sample_cf_ref_tabular(model, x, target, cf_pool, score=args.score)
+            # GradCF = endpoint cua GradPath; tinh nhanh bang chinh ig2 path (chi lay baseline)
+            with torch.enable_grad():
+                eta = x.abs().mean().item() * 2.0 + 1e-3
+                x_ref_rep = rep_fn(xr).detach()
+                delta = torch.zeros_like(x)
+                for _ in range(args.ig2_steps):
+                    xd = (x + delta).clone().requires_grad_(True)
+                    d = (rep_fn(xd) - x_ref_rep).pow(2).sum()
+                    g, = torch.autograd.grad(d, xd)
+                    delta = (delta - eta * g / (g.norm() + 1e-12)).detach()
+                return (x + delta).detach()               # GradCF
         return None            # IG-random, EG-*: pool nhieu diem -> bo qua debug
 
     @torch.no_grad()
@@ -231,6 +276,8 @@ def main():
     methods += [f"EG-{K}" for K in args.eg_K]
     methods += [f"Shrinkage-IG@{t:g}" for t in args.tau_sweep]
     methods += ["PM-IG-PPCA"]
+    if args.rivals:
+        methods += ["IG-MaxEnt", "FRInGe", "IG2"]
     print(f"[i] PM-IG-PPCA psi(estimated) = {psi:.4f}  (rank q={min(args.ppca_q, D-1)})")
     print(f"[i] metric = {args.metric}"
           + (f"  (insertion/deletion remove-to-{args.insdel_mode})\n" if args.metric == "insdel"

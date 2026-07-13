@@ -174,3 +174,120 @@ def fringe_attribution(model, x, target, n_class, grad_fn,
         ds = (s_all[j + 1] - s_all[j])
         phi += g[j] * (x - b0) * ds
     return phi
+
+
+# ===========================================================================
+# ============  BAN TABULAR (vector D-chieu, MLP)  ==========================
+# ===========================================================================
+# score_target-style scalar cho MLP tabular (khop synthetic_e0.score_target).
+def _tab_score(model, x, target, score="softmax"):
+    single = (x.dim() == 1)
+    out = model(x[None] if single else x)
+    if getattr(model, "n_out", 2) == 1:
+        s = out.squeeze(-1)
+    elif score == "logit":
+        s = out[:, target]
+    else:
+        s = F.softmax(out, dim=1)[:, target]
+    return s[0] if single else s
+
+
+def mlp_penultimate(model):
+    """Representation = output truoc lop Linear cuoi cua model.net (sau GELU thu 2)."""
+    layers = list(model.net.children())
+    feat = torch.nn.Sequential(*layers[:-1])          # bo Linear cuoi
+    def rep(x):                                       # x: (M,D) hoac (D,)
+        single = (x.dim() == 1)
+        h = feat(x[None] if single else x)
+        return h                                      # (M, hidden)
+    return rep
+
+
+# ---- 1) IG2 tabular (GradCF + GradPath) ----
+def ig2_tabular(model, x, x_ref, target, rep_fn, steps=40, step_size=None,
+                score="softmax"):
+    """x,(x_ref): (D,). Tra ve phi (D,)."""
+    eta = step_size if step_size is not None else (x.abs().mean().item() * 2.0 + 1e-3)
+    x_ref_rep = rep_fn(x_ref).detach()
+    delta = torch.zeros_like(x)
+    path = [x.detach().clone()]
+    for _ in range(steps):
+        xd = (x + delta).clone().requires_grad_(True)
+        d = (rep_fn(xd) - x_ref_rep).pow(2).sum()
+        g, = torch.autograd.grad(d, xd)
+        Wn = g.norm(p=2) + 1e-12
+        delta = (delta - eta * g / Wn).detach()
+        path.append((x + delta).detach().clone())
+    path = path[::-1]                                 # GradCF..x
+    phi = torch.zeros_like(x)
+    for j in range(len(path) - 1):
+        gj = path[j].clone().requires_grad_(True)
+        logit = _tab_score(model, gj, target, score)
+        gf, = torch.autograd.grad(logit, gj, retain_graph=True)
+        dcf = (rep_fn(gj) - x_ref_rep).pow(2).sum().sqrt()
+        gc, = torch.autograd.grad(dcf, gj)
+        Wn = gc.norm(p=2) + 1e-12
+        phi += (gf.detach() * gc.detach()) * (eta / Wn)
+    return phi
+
+
+def sample_cf_ref_tabular(model, x, target, pool, score="softmax"):
+    """Chon 1 vector trong pool (M,D) co lop du doan KHAC target."""
+    with torch.no_grad():
+        preds = model(pool).argmax(1)
+        mask = preds != target
+        if mask.any():
+            cand = pool[mask]
+            # uu tien confident nhat o lop cua no
+            sc = F.softmax(model(cand), 1).max(1).values
+            return cand[sc.argmax()]
+    return pool[0]
+
+
+# ---- 2) Max-Entropy baseline tabular ----
+def max_entropy_baseline_tab(model, x, n_class, steps=100, lr=0.05):
+    b = x.clone().detach().requires_grad_(True)
+    opt = torch.optim.Adam([b], lr=lr)
+    logu = torch.full((1, n_class), 1.0 / n_class, device=x.device).log()
+    for _ in range(steps):
+        logp = F.log_softmax(model(b[None]), 1)
+        kl = (logp.exp() * (logp - logu)).sum()
+        opt.zero_grad(); kl.backward(); opt.step()
+    return b.detach()
+
+
+def ig_from_baseline_tab(model, x, x0, target, T=64, score="softmax"):
+    """IG thang tu x0 -> x (tabular), dung score_target."""
+    a = ((torch.arange(T, device=x.device) + 0.5) / T).view(-1, 1)
+    states = x0[None] + a * (x - x0)[None]            # (T,D)
+    states = states.clone().requires_grad_(True)
+    s = _tab_score(model, states, target, score).sum()
+    g, = torch.autograd.grad(s, states)
+    return g.mean(0) * (x - x0)
+
+
+# ---- 3) FRInGe tabular (max-ent ref + Fisher-Rao geodesic path) ----
+def fringe_tabular(model, x, target, n_class, steps=50, me_steps=100, score="softmax"):
+    import math
+    b0 = max_entropy_baseline_tab(model, x, n_class, steps=me_steps)
+    with torch.no_grad():
+        p_x = F.softmax(model(x[None]), 1)[0]
+        p_u = torch.full_like(p_x, 1.0 / n_class)
+        bc = (p_u.sqrt() * p_x.sqrt()).sum().clamp(-1, 1)
+        theta = torch.arccos(bc).item()
+    ts = (torch.arange(steps, device=x.device) + 0.5) / steps
+    if theta < 1e-4:
+        s_of_t = ts
+    else:
+        s_of_t = torch.tensor([math.sin(t.item()*theta)/math.sin(theta) for t in ts],
+                              device=x.device)
+    s_all = torch.cat([torch.zeros(1, device=x.device), s_of_t])
+    states = torch.stack([b0 + s * (x - b0) for s in s_of_t], 0)   # (steps,D)
+    states = states.clone().requires_grad_(True)
+    sc = _tab_score(model, states, target, score).sum()
+    g, = torch.autograd.grad(sc, states)
+    phi = torch.zeros_like(x)
+    for j in range(steps):
+        ds = (s_all[j + 1] - s_all[j])
+        phi += g[j] * (x - b0) * ds
+    return phi

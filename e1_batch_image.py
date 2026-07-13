@@ -315,7 +315,7 @@ def wilcoxon(a, b):
 
 
 def _print_summary_table(metric_names, acc, id_per_image, n_img, title, bl_strength=None,
-                         sigma_sweep=None, eps=0.05):
+                         sigma_sweep=None, eps=0.05, sigstar=None, sigstar_diag=None):
     win_count = {m: 0 for m in metric_names}
     for d in id_per_image:
         win_count[max(d, key=d.get)] += 1
@@ -377,6 +377,34 @@ def _print_summary_table(metric_names, acc, id_per_image, n_img, title, bl_stren
     print("[i] Δf/|b-x| = DO THAY DOI DAU RA / DO THAY DOI DAU VAO. Mot TI SO, khong phai dao ham.")
     print("[i]   Tinh duoc cho MOI hang (ke ca black/blur/EG/IG2). Khong can K, khong can mu,")
     print("[i]   khong can D, khong phu thuoc grid, khong bao gio am.")
+    # ---- sigma* CLOSED FORM (in NGAY, khong doi het 50 anh) ----
+    if sigstar:
+        import statistics as _st
+        ss = sorted(sigstar)
+        n_ = len(ss)
+        med = ss[n_ // 2]
+        q1, q3 = ss[n_ // 4], ss[(3 * n_) // 4]
+        print(f"\n[sigma*] CLOSED FORM (Fourier, 1 backward/anh, KHONG sweep)  n={n_}")
+        print(f"[i]   median {med:.3f}  mean {sum(ss)/n_:.3f}  IQR [{q1:.3f}, {q3:.3f}]  (pixel)")
+        if sigstar_diag and sigstar_diag.get("sd_log_w"):
+            sdw = sorted(sigstar_diag["sd_log_w"])[len(sigstar_diag["sd_log_w"]) // 2]
+            kef = sorted(sigstar_diag["k_eff"])[len(sigstar_diag["k_eff"]) // 2]
+            wev = sorted(sigstar_diag["w_ev"])[len(sigstar_diag["w_ev"]) // 2]
+            print(f"[i]   w_ev median {wev:.5f} rad/px   k_eff {kef:.0f}   sd(log w) {sdw:.3f}")
+            if sdw > 1.5:
+                print(f"[!!]  sd(log w) = {sdw:.2f} LON => evidence TRAI DEU tren nhieu bac tan so")
+                print(f"[!!]   (pho anh 1/f^2). Trung binh co trong so = tam phan bo PHANG")
+                print(f"[!!]   => sigma* KEM TIN CAY o vision. Noi ro han che nay.")
+        if sigma_sweep:
+            near = min(sigma_sweep, key=lambda sg: abs(math.log(max(sg, 1e-9)) - math.log(max(med, 1e-9))))
+            hit = f"Shrinkage-IG@{near:g}"
+            agree2 = "KHOP" if hit == best_m else "LECH"
+            print(f"[i]   sigma* median {med:.3f} -> gan nhat tren sweep: {hit}   [{agree2} voi best I-D]")
+            print(f"[i]   sweep = {sigma_sweep}")
+        print("[!]  Vision dung GAUSSIAN BLUR (gain = exp(-0.5 σ²ω²)), KHONG phai shrinkage")
+        print("[!]   gain τ/(s+τ). sigma* cat tai TAN SO evidence, khong phai PHUONG SAI")
+        print("[!]   evidence. Hai dai luong KHAC NHAU — chi trung khi Σ stationary (Cor.2).")
+
     if best_ratio:
         agree = "KHOP" if best_ratio == best_m else "LECH"
         print(f"[i] max Δf/|b-x| = {best_ratio} ({ratio_dx[best_ratio]:.5g})   [{agree} voi best I-D]")
@@ -391,6 +419,7 @@ def _print_summary_table(metric_names, acc, id_per_image, n_img, title, bl_stren
 
 
 def main():
+    import torch.nn.functional as F_
     args = parse_args()
     device = args.device
     if device == "cuda" and not torch.cuda.is_available():
@@ -426,6 +455,8 @@ def main():
     bl_strength = {}          # {method: {"pf":[], "pb":[], "ratio":[], "shift":[]}}
 
     diag_pool = []          # [(x, target)] giu lai cho DENSE sigma sweep (--tau_diag)
+    sigstar_all = []        # sigma* per-anh (--tau_star), tinh NGAY trong loop
+    sigstar_diag = {"w_ev": [], "sd_log_w": [], "k_eff": []}
     for ip, path in enumerate(paths):
         x = preprocess(Image.open(path), size=224, device=device)
         if args.target is None:
@@ -435,6 +466,18 @@ def main():
             target = args.target
         if getattr(args, "tau_diag", False) or getattr(args, "tau_star", False):
             diag_pool.append((x.detach(), int(target)))
+        # --- sigma* CLOSED FORM: tinh NGAY, khong doi het 50 anh ---
+        if getattr(args, "tau_star", False):
+            import tau_star as _ts
+            xg = x.clone().requires_grad_(True)
+            _out = model(xg[None])
+            _sc = (F_.softmax(_out, 1)[0, target] if args.score == "softmax" else _out[0, target])
+            _g, = torch.autograd.grad(_sc, xg)
+            _sig, _sd = _ts.sigma_star_fourier(x.detach(), _g.detach())
+            sigstar_all.append(float(_sig))
+            sigstar_diag["w_ev"].append(float(_sd["w_ev"]))
+            sigstar_diag["sd_log_w"].append(float(_sd["sd_log_w"]))
+            sigstar_diag["k_eff"].append(float(_sd["k_eff"]))
         grad_fn = make_resnet50_gradfn(model, target, device, chunk=args.chunk, score=args.score)
 
         # --- DEBUG: baseline strength f(x) vs f(baseline) ---
@@ -473,6 +516,7 @@ def main():
         if args.report_every > 0 and ((ip + 1) % args.report_every == 0 or ip + 1 == len(paths)):
             _print_summary_table(metric_names, acc, id_per_image, ip + 1, bl_strength=bl_strength,
                                  sigma_sweep=args.sigma_sweep,
+                                 sigstar=sigstar_all, sigstar_diag=sigstar_diag,
                                  title=f"TICH LUY sau {ip+1} anh")
 
     n_img = len(id_per_image)
@@ -480,46 +524,30 @@ def main():
     for d in id_per_image:
         win_count[max(d, key=d.get)] += 1
 
-    # =====================================================================
-    # sigma* CLOSED FORM (Fourier). MOT backward pass moi anh, KHONG sweep.
-    # =====================================================================
-    if getattr(args, "tau_star", False) and diag_pool:
-        import tau_star as taustar
-        X_ts = torch.stack([p_ for p_, _ in diag_pool], 0)
-        T_ts = [t_ for _, t_ in diag_pool]
-        Gs = []
-        for i0 in range(X_ts.shape[0]):
-            xi = X_ts[i0].clone().requires_grad_(True)
-            out = model(xi[None])
-            sc = (torch.nn.functional.softmax(out, 1)[0, T_ts[i0]] if args.score == "softmax"
-                  else out[0, T_ts[i0]])
-            gi, = torch.autograd.grad(sc, xi)
-            Gs.append(gi.detach())
-        G_ts = torch.stack(Gs, 0)
-        sig_star, sdiag = taustar.sigma_star_fourier(X_ts, G_ts)
-        taustar.print_sigma_star(sig_star, sdiag, sigma_sweep=args.sigma_sweep,
-                                 tag="[vision/ResNet50]")
-
-        # doi chieu voi sweep sigma hien co
-        with torch.no_grad():
-            sw = sorted(args.sigma_sweep)
-            M_ = X_ts.shape[0]
-            Dm = torch.zeros(M_, len(sw), device=X_ts.device)
-            Lm = torch.zeros(M_, len(sw), device=X_ts.device)
-            tg = torch.tensor(T_ts, device=X_ts.device)
-            fx = torch.nn.functional.softmax(model(X_ts), 1)[torch.arange(M_), tg]
-            for j, sg in enumerate(sw):
-                B = torch.stack([spectral_reference_fft(X_ts[i], sigma=sg) for i in range(M_)], 0)
-                fb = torch.nn.functional.softmax(model(B), 1)[torch.arange(M_), tg]
-                Dm[:, j] = fx - fb
-                Lm[:, j] = (X_ts - B).reshape(M_, -1).norm(dim=1)
-        taustar.compare_rules(torch.tensor(sw, device=X_ts.device, dtype=torch.float),
-                              Lm, Dm, sig_star)
-
     print("\n" + "=" * 80)
     best_overall = _print_summary_table(metric_names, acc, id_per_image, n_img, bl_strength=bl_strength,
                                         sigma_sweep=args.sigma_sweep,
+                                        sigstar=sigstar_all, sigstar_diag=sigstar_diag,
                                         title=f"KET QUA CUOI CUNG tren {n_img} anh")
+
+    # ---- DOI CHIEU sigma* vs sweep (chay 1 lan o cuoi — can quet lai het sigma) ----
+    if getattr(args, "tau_star", False) and diag_pool and len(args.sigma_sweep) >= 2:
+        import tau_star as _ts
+        X_ts = torch.stack([p_ for p_, _ in diag_pool], 0)
+        tg = torch.tensor([t_ for _, t_ in diag_pool], device=X_ts.device)
+        M_ = X_ts.shape[0]
+        sw = sorted(args.sigma_sweep)
+        with torch.no_grad():
+            Dm = torch.zeros(M_, len(sw), device=X_ts.device)
+            Lm = torch.zeros(M_, len(sw), device=X_ts.device)
+            fx = F_.softmax(model(X_ts), 1)[torch.arange(M_, device=X_ts.device), tg]
+            for j, sg in enumerate(sw):
+                B = torch.stack([spectral_reference_fft(X_ts[i], sigma=sg) for i in range(M_)], 0)
+                fb = F_.softmax(model(B), 1)[torch.arange(M_, device=X_ts.device), tg]
+                Dm[:, j] = fx - fb
+                Lm[:, j] = (X_ts - B).reshape(M_, -1).norm(dim=1)
+        _ts.compare_rules(torch.tensor(sw, device=X_ts.device, dtype=torch.float),
+                          Lm, Dm, torch.tensor(sigstar_all, device=X_ts.device))
 
     # ---- f(x) PER-IMAGE (bang chinh in mean; day in phan tan) ----
     if bl_strength:

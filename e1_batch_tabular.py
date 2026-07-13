@@ -121,6 +121,14 @@ def train_classifier(Xtr, ytr, n_class, args, device):
     return model
 
 
+def _fmt_strength(s):
+    """s = (pf, pb, ratio, shift) hoac None -> 4 cot da can le."""
+    if s is None:
+        return f"{'-':>8}{'-':>8}{'-':>8}{'-':>9}"
+    pf, pb, r, sh = s
+    return f"{pf:>8.4f}{pb:>8.4f}{r:>8.4f}{sh:>9.4f}"
+
+
 def main():
     args = parse_args()
     device = args.device
@@ -189,6 +197,36 @@ def main():
     def is_stochastic(name):
         return name == "IG-random" or name.startswith("EG-")
 
+    def baseline_vec_for(name, x):
+        """Baseline DIEM cho method (khop attr_for). None neu khong 1-diem (EG/random pool)."""
+        if name == "IG-zero":   return zero
+        if name == "IG-mean":   return mu
+        if name == "IG-median": return med
+        if name.startswith("Shrinkage-IG@"):
+            return shrinkage_baseline(x, ref, tau=float(name.split("@")[1]))
+        if name == "PM-IG-PPCA":
+            return shrinkage_baseline(x, ppca_ref, tau=psi)
+        return None            # IG-random, EG-*: pool nhieu diem -> bo qua debug
+
+    @torch.no_grad()
+    def baseline_strength(name):
+        """TB tren X_eval: f(x)=softmax(target)@x, f(xt)=@baseline, ratio, |b-x|."""
+        b0 = baseline_vec_for(name, X_eval[0])
+        if b0 is None:
+            return None
+        pf_l, pb_l, r_l, sh_l = [], [], [], []
+        for i in range(X_eval.shape[0]):
+            x = X_eval[i]
+            b = baseline_vec_for(name, x)
+            pf = score_target(model, x, target=target, score="softmax").item()
+            pb = score_target(model, b, target=target, score="softmax").item()
+            pf_l.append(pf); pb_l.append(pb)
+            r_l.append(pb / pf if pf > 1e-9 else float("nan"))
+            sh_l.append((b - x).abs().mean().item())
+        rr = [r for r in r_l if r == r]
+        return (sum(pf_l)/len(pf_l), sum(pb_l)/len(pb_l),
+                sum(rr)/len(rr) if rr else float("nan"), sum(sh_l)/len(sh_l))
+
     methods = ["IG-zero", "IG-mean", "IG-median", "IG-random"]
     methods += [f"EG-{K}" for K in args.eg_K]
     methods += [f"Shrinkage-IG@{t:g}" for t in args.tau_sweep]
@@ -198,10 +236,14 @@ def main():
           + (f"  (insertion/deletion remove-to-{args.insdel_mode})\n" if args.metric == "insdel"
              else "  (Soft-Faith — KHONG hop tabular 1-chieu du thua, chi tham khao)\n"))
 
+    # baseline strength f(x) vs f(baseline) cho moi method (None neu pool nhieu diem)
+    bl_str = {nm: baseline_strength(nm) for nm in methods}
+
     table, gaps_by_method = {}, {}
     if args.metric == "soft":
-        print(f"{'method':<20}{'Soft-NC↑':>12}{'Soft-NS↑':>12}{'Soft-gap↑':>12}{'  (gap ± boot-SE)'}")
-        print("-" * 68)
+        print(f"{'method':<20}{'Soft-NC↑':>12}{'Soft-NS↑':>12}{'Soft-gap↑':>12}"
+              f"{'f(x)':>8}{'f(xt)':>8}{'ratio':>8}{'|b-x|':>9}{'  (gap±SE)'}")
+        print("-" * 92)
         for nm in methods:
             ncs, nss, gaps = [], [], []
             for i in range(X_eval.shape[0]):
@@ -217,12 +259,14 @@ def main():
                          "id_gap": gap_t.mean().item(), "id_se": se,
                          "rank_key": sum(ncs) / len(ncs),          # xep hang theo Soft-NC
                          "nc_list": ncs}                            # cho paired test theo NC
+            fx, fxt, rt, sh = _fmt_strength(bl_str.get(nm))
             print(f"{nm:<20}{table[nm]['soft_nc']:>12.4f}{table[nm]['soft_ns']:>12.4f}"
-                  f"{table[nm]['id_gap']:>12.4f}   ± {se:.4f}")
+                  f"{table[nm]['id_gap']:>12.4f}{fx}{fxt}{rt}{sh}   ± {se:.4f}")
     else:
         print(f"{'method':<20}{'insertion↑':>12}{'deletion↓':>12}{'I-D↑':>10}"
-              f"{'  (mean ± boot-SE [± seed-std])'}")
-        print("-" * 74)
+              f"{'f(x)':>8}{'f(xt)':>8}{'ratio':>8}{'|b-x|':>9}"
+              f"{'  (mean±SE[±seed-std])'}")
+        print("-" * 96)
         idg = torch.Generator(device="cpu"); idg.manual_seed(args.seed + 7)   # boc marginal
         for nm in methods:
             seeds = list(range(args.rand_seeds)) if is_stochastic(nm) else [None]
@@ -253,13 +297,19 @@ def main():
                          "id_gap": per_sample_gap.mean().item(), "id_se": se,
                          "seed_std": seed_std, "n_seeds": len(seeds)}
             tail = f"   ± {se:.4f}" + (f"  [seed-std {seed_std:.4f}, n={len(seeds)}]" if len(seeds) > 1 else "")
+            fx, fxt, rt, sh = _fmt_strength(bl_str.get(nm))
             print(f"{nm:<20}{table[nm]['insertion']:>12.4f}{table[nm]['deletion']:>12.4f}"
-                  f"{table[nm]['id_gap']:>10.4f}{tail}")
+                  f"{table[nm]['id_gap']:>10.4f}{fx}{fxt}{rt}{sh}{tail}")
 
     gap_label = "Soft-gap" if args.metric == "soft" else "I-D"
     print("-" * 68)
     best = max(table, key=lambda k: table[k]["id_gap"])
-    print(f"[i] best {gap_label}: {best} = {table[best]['id_gap']:.4f} ± {table[best]['id_se']:.4f}")
+    print(f"[i] best {gap_label}: {best} = {table[best]['id_gap']:.4f} ± {table[best]['id_se']:.4f}"
+          f"   <-- best")
+    if bl_str.get(best):
+        pf, pb, r, sh = bl_str[best]
+        print(f"[i] baseline strength cua best: f(x)={pf:.4f} f(xt)={pb:.4f} ratio={r:.4f} |b-x|={sh:.4f}")
+    print("[i] ratio~1 => baseline chua xoa gi; ratio thap => trung tinh/lat lop (vd IG-zero OOD).")
 
     # ---- Paired test: Shrinkage-IG(gap tot nhat) vs baseline (ghep cap per-sample) ----
     shr = [m for m in methods if m.startswith("Shrinkage-IG")]

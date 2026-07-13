@@ -127,15 +127,21 @@ def make_eg_pool(x, K, noise, device, seed):
     return x[None] + eps                                   # (K,3,H,W)
 
 
-def collect_baselines_for_image(x, args, device, seed):
+def collect_baselines_for_image(x, args, device, seed, adaptive_sigma=None):
     """
     Tra ve dict {method: baseline_tensor(3,H,W)} — DUNG cach attribution tao baseline,
     de debug f(x) vs f(baseline). Shrinkage-IG@sigma -> Wiener low-pass FFT;
     IG-<fixed> -> black/white/noise/mean/blur. (EG bo qua: baseline la pool, khong 1 diem.)
+
+    adaptive_sigma : {rule: sigma_cua_anh_nay} — baseline DIEM cho Shrinkage-Adaptive-<rule>
+                     (sigma per-image do rule sigma_rate/sigma* chon). Cung 1 diem => debug duoc.
     """
     out = {}
     for sig in args.sigma_sweep:
         out[f"Shrinkage-IG@{sig:g}"] = spectral_reference_fft(x, sigma=sig)
+    if adaptive_sigma:
+        for rule, sg in adaptive_sigma.items():
+            out[f"Shrinkage-Adaptive-{rule}"] = spectral_reference_fft(x, sigma=float(sg))
     if not args.no_fixed:
         names, fixed = make_fixed_baselines(x, device, seed)
         for nm, b in zip(names, fixed):
@@ -174,18 +180,30 @@ def baseline_strength_row(model, x, baseline, target):
 
 
 def attributions_for_image(x, grad_fn, args, device, seed,
-                           model=None, target=None, rep_fn=None, ref_pool=None, n_class=1000):
+                           model=None, target=None, rep_fn=None, ref_pool=None, n_class=1000,
+                           adaptive_sigma=None):
     """
     Chi IG + baseline (theo E1, path thang). Tra ve dict {method: attr(3,H,W)}.
-      - Shrinkage-IG@sigma : baseline = Wiener low-pass FFT (blur), IG thang toi x.
-      - IG-<fixed>         : black/white/noise/mean/blur.
-      - EG-K               : trung binh IG tren K random-sample baseline, ngan sach chia deu.
+      - Shrinkage-IG@sigma        : baseline = Wiener low-pass FFT (blur), IG thang toi x.
+      - Shrinkage-Adaptive-<rule> : baseline = FFT blur voi sigma PER-IMAGE do rule
+                                     (sigma_rate / sigma*) chon => IG thang. Day la thu
+                                     DUY NHAT kiem duoc rule co dung khong: moi rule
+                                     truoc gio chi duoc BAO CAO, chua he duoc DUNG de
+                                     TAO attribution roi cham diem (khop e1_batch_tabular.py).
+      - IG-<fixed>                : black/white/noise/mean/blur.
+      - EG-K                      : trung binh IG tren K random-sample baseline, ngan sach chia deu.
     """
     out = {}
     # --- Shrinkage-IG (FFT), quet sigma. Blur-IG = mot diem tren truc nay. ---
     for sig in args.sigma_sweep:
         ref = spectral_reference_fft(x, sigma=sig)         # (3,H,W) Wiener low-pass
         out[f"Shrinkage-IG@{sig:g}"] = ig_single(x, ref, grad_fn, T=args.N)
+
+    # --- Shrinkage-Adaptive: sigma PER-IMAGE do rule chon (sigma_rate / sigma*) ---
+    if adaptive_sigma:
+        for rule, sg in adaptive_sigma.items():
+            ref = spectral_reference_fft(x, sigma=float(sg))
+            out[f"Shrinkage-Adaptive-{rule}"] = ig_single(x, ref, grad_fn, T=args.N)
 
     # --- baseline co dinh ---
     if not args.no_fixed:
@@ -497,8 +515,92 @@ def main():
     bl_strength = {}          # {method: {"pf":[], "pb":[], "ratio":[], "shift":[]}}
 
     diag_pool = []          # [(x, target)] giu lai cho DENSE sigma sweep (--tau_diag)
-    sigstar_all = []        # sigma* per-anh (--tau_star), tinh NGAY trong loop
+    sigstar_all = []        # sigma* per-anh (--tau_star), tinh o PRE-PASS
     sigstar_diag = {"w_ev": [], "sd_log_w": [], "k_eff": [], "frac_top10": [], "frac_pos": []}
+
+    # =====================================================================
+    # PRE-PASS: chon sigma PER-IMAGE bang rule NOI TAI (chi forward/1 backward),
+    # roi vong chinh se DUNG sigma do tao Shrinkage-Adaptive-<rule> va cham diem
+    # ins/del that. Khop e1_batch_tabular.py: moi rule truoc gio chi duoc BAO CAO,
+    # gio moi duoc DUNG. Cham TRUOC vong chinh vi attribution cua anh i can sigma_i.
+    #   sigma*      : tau_star.sigma_star_fourier   (1 backward/anh, KHONG sweep)
+    #   sigma_rate  : tau_diag.selection_rules      (ti gia bien, DENSE forward sweep)
+    #   sigma_knee  : tau_diag.selection_rules      (Kneedle per-input tren [i, f(b)])
+    # adaptive_sigma_per_image[i] = {rule: sigma_cua_anh_i}
+    # =====================================================================
+    adaptive_sigma_per_image = [dict() for _ in paths]
+    _need_prepass = getattr(args, "tau_star", False) or getattr(args, "tau_diag", False)
+    if _need_prepass:
+        print("[i] PRE-PASS: chon sigma per-image (rule noi tai) truoc khi cham diem...")
+        # thu thap x + target 1 lan (dung lai cho ca sweep cuoi -> diag_pool)
+        _imgs = []
+        for path in paths:
+            x = preprocess(Image.open(path), size=224, device=device)
+            if args.target is None:
+                with torch.no_grad():
+                    tgt = model(x[None]).argmax(1).item()
+            else:
+                tgt = args.target
+            _imgs.append((x.detach(), int(tgt)))
+        diag_pool = list(_imgs)
+
+        # --- sigma* CLOSED FORM per-anh (1 backward/anh) ---
+        if getattr(args, "tau_star", False):
+            import tau_star as _ts
+            for i, (x, tgt) in enumerate(_imgs):
+                xg = x.clone().requires_grad_(True)
+                _out = model(xg[None])
+                _sc = (F_.softmax(_out, 1)[0, tgt] if args.score == "softmax" else _out[0, tgt])
+                _g, = torch.autograd.grad(_sc, xg)
+                _sig, _sd = _ts.sigma_star_fourier(x, _g.detach(), frac=args.star_frac)
+                sigstar_all.append(float(_sig))
+                for _k in ("w_ev", "sd_log_w", "k_eff", "frac_top10", "frac_pos"):
+                    sigstar_diag[_k].append(float(_sd[_k]))
+                adaptive_sigma_per_image[i]["star"] = float(_sig)
+
+        # --- sigma_rate / sigma_knee tu DENSE forward sweep (--tau_diag) ---
+        if getattr(args, "tau_diag", False):
+            import tau_diag as _td
+            import torch.nn.functional as F
+            X_st = torch.stack([p_ for p_, _ in _imgs], 0)
+            tgt_st = torch.tensor([t_ for _, t_ in _imgs], device=X_st.device)
+
+            @torch.no_grad()
+            def _score_pp(Z):
+                out = []
+                for i0 in range(0, Z.shape[0], 16):
+                    z = Z[i0:i0 + 16]
+                    pr = F.softmax(model(z), 1)
+                    out.append(pr[torch.arange(z.shape[0], device=z.device),
+                                  tgt_st[i0:i0 + z.shape[0]]])
+                return torch.cat(out, 0)
+
+            sig_grid = _td.log_tau_grid(args.diag_lo, args.diag_hi, args.diag_n)
+            mu_img = torch.zeros_like(X_st[0])
+            curve_pp = _td.sweep_curve(
+                X_st, _score_pp,
+                lambda x, sg: spectral_reference_fft(x, sigma=sg),
+                sig_grid, mu=mu_img,
+            )
+            rules_pp, valid_pp = _td.selection_rules(curve_pp, eps=args.diag_eps)
+            for _r, _t in rules_pp.items():
+                if _r.startswith("_"):
+                    continue
+                name = _r.replace("tau_", "")          # rate / knee
+                for i in range(len(_imgs)):
+                    adaptive_sigma_per_image[i][name] = float(_t[i])
+        _rules_found = sorted({r for d in adaptive_sigma_per_image for r in d})
+        if _rules_found:
+            print(f"[i] Shrinkage-Adaptive rule: {', '.join(_rules_found)} "
+                  f"(sigma PER-IMAGE, se cham ins/del that)")
+            for _r in _rules_found:
+                _vs = sorted(d[_r] for d in adaptive_sigma_per_image if _r in d)
+                if _vs:
+                    _n = len(_vs); _md = _vs[_n // 2]
+                    print(f"[i]   {_r:<6} sigma: median {_md:.3f}  "
+                          f"IQR [{_vs[_n//4]:.3f}, {_vs[(3*_n)//4]:.3f}]  (pixel)")
+        print()
+
     for ip, path in enumerate(paths):
         x = preprocess(Image.open(path), size=224, device=device)
         if args.target is None:
@@ -506,23 +608,13 @@ def main():
                 target = model(x[None]).argmax(1).item()
         else:
             target = args.target
-        if getattr(args, "tau_diag", False) or getattr(args, "tau_star", False):
-            diag_pool.append((x.detach(), int(target)))
-        # --- sigma* CLOSED FORM: tinh NGAY, khong doi het 50 anh ---
-        if getattr(args, "tau_star", False):
-            import tau_star as _ts
-            xg = x.clone().requires_grad_(True)
-            _out = model(xg[None])
-            _sc = (F_.softmax(_out, 1)[0, target] if args.score == "softmax" else _out[0, target])
-            _g, = torch.autograd.grad(_sc, xg)
-            _sig, _sd = _ts.sigma_star_fourier(x.detach(), _g.detach(), frac=args.star_frac)
-            sigstar_all.append(float(_sig))
-            for _k in ("w_ev", "sd_log_w", "k_eff", "frac_top10", "frac_pos"):
-                sigstar_diag[_k].append(float(_sd[_k]))
+        # (sigma* / diag_pool da tinh o PRE-PASS; khong lam lai o day)
+        adaptive_sigma = adaptive_sigma_per_image[ip] if _need_prepass else None
         grad_fn = make_resnet50_gradfn(model, target, device, chunk=args.chunk, score=args.score)
 
         # --- DEBUG: baseline strength f(x) vs f(baseline) ---
-        for m, b in collect_baselines_for_image(x, args, device, args.seed).items():
+        for m, b in collect_baselines_for_image(x, args, device, args.seed,
+                                                 adaptive_sigma=adaptive_sigma).items():
             pf, pb, ratio, shift, df = baseline_strength_row(model, x, b, target)
             d = bl_strength.setdefault(m, {"pf": [], "pb": [], "ratio": [], "shift": [],
                                            "df": []})
@@ -531,7 +623,8 @@ def main():
 
         attrs = attributions_for_image(x, grad_fn, args, device, args.seed,
                                        model=model, target=target, rep_fn=rep_fn,
-                                       ref_pool=ref_pool, n_class=n_class)
+                                       ref_pool=ref_pool, n_class=n_class,
+                                       adaptive_sigma=adaptive_sigma)
         if metric_names is None:
             metric_names = list(attrs.keys())
             for m in metric_names:

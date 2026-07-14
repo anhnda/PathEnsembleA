@@ -345,24 +345,44 @@ def selection_rules(curve: dict, eps: float = 0.05):
     out["tau_rate"] = taus[idx_star]
     at_edge = float((idx_star[valid] == T - 1).float().mean().item()) if int(valid.sum()) else 0.0
 
-    # --- tau_knee: DIEM DOC DAU TIEN tren [i, f(b)] , PER-INPUT ---
+    # --- tau_knee: Kneedle 'knee DAU' tren [index, f(b)], PER-INPUT ---
     #
     # LICH SU:
     #  (1) Trung binh cac duong cong roi tim knee -> SAI. b_tau(x) phu thuoc x =>
     #      moi input mot duong cong rieng. Sua: per-input.
-    #  (2) Kneedle chuan (max khoang cach toi duong cheo) -> SAP: tra ve DAY GRID
-    #      o MOI input (tau=0.00047, IQR=0).
-    #      Ly do: f(b) vs index co dang SIGMOID NGUOC (phang -> doc -> phang),
-    #      tuc LOI o dau roi LOM o cuoi — HAI diem uon. Kneedle gia dinh duong
-    #      giam LOM (doc-roi-phang) va chi bat duoc MOT. Sai dang => rot ve dau.
+    #  (2) Kneedle argmax TOAN CUC -> SAP: f(b) vs index dang SIGMOID NGUOC / HAI-UON
+    #      (phang -> doc -> phang, doi khi doi len roi doc lai). argmax nhay sang
+    #      dinh SAU (day grid) => tau=0.00047, IQR=0.
+    #  (3) max-slope (argmax do doc f_b) -> chon cho baseline xoa MANH NHAT, tuc tau
+    #      LON. Bang oracle: knee(max-slope) tabular THUA ca hang so (0.420<0.430).
+    #      max-slope tim diem giua doc, khong phai knee dau.
     #
-    # SUA: lay DIEM DOC DAU TIEN — index j dau tien dat |f'| cuc dai.
-    #      f' = sai phan f(b) theo index (buoc = 1, nen chi la hieu).
-    #      Do la cho baseline BAT DAU thuc su xoa thong tin.
+    # SUA (DONG BO voi e1_batch_image): Kneedle DINH CUC BO DAU TIEN.
+    #   d[j] = (1 - index_hat[j]) - f_b_hat[j]  (chuan hoa [0,1], f_b giam).
+    #   Lay dinh cuc bo DAU cua d, voi hai chan chong nhieu:
+    #     (a) index >= KNEE_MIN_FRAC * T  (bo vung dau grid lang tang)
+    #     (b) dinh cao hon lan can >= KNEE_DELTA
+    #   Fallback: argmax d tren [j0:].  Bat duoc knee DAU cua duong hai-uon.
+    KNEE_MIN_FRAC, KNEE_DELTA = 0.20, 0.02
     f_b = curve["rho"] * curve["f_x"][:, None]                    # (M,T) f(b) PER-INPUT
-    df_di = f_b[:, :-1] - f_b[:, 1:]                              # (M,T-1) do DOC (duong)
-    j_star = df_di.argmax(dim=1)                                  # khoang doc nhat
-    out["tau_knee"] = taus[(j_star + 1).clamp_max(T - 1)]         # DIEM CUOI khoang do
+    _lo = f_b.min(dim=1, keepdim=True).values
+    _rng = (f_b.max(dim=1, keepdim=True).values - _lo).clamp_min(1e-12)
+    _yh = (f_b - _lo) / _rng                                      # (M,T) giam 1 -> 0
+    _xh = torch.arange(T, device=dev, dtype=torch.float) / max(T - 1, 1)
+    _d = (1.0 - _xh)[None] - _yh                                  # (M,T) khoang cach toi cheo
+    _j0 = max(1, int(math.ceil(KNEE_MIN_FRAC * T)))
+    _dn = _d.detach().cpu().numpy()
+    _jsel = torch.empty(M, dtype=torch.long, device=dev)
+    for i in range(M):
+        di = _dn[i]; js = None
+        for j in range(_j0, T - 1):
+            if di[j] >= di[j-1] and di[j] > di[j+1] \
+               and (di[j] - min(di[j-1], di[j+1])) >= KNEE_DELTA:
+                js = j; break                                    # dinh cuc bo DAU TIEN
+        if js is None:
+            js = _j0 + int(di[_j0:].argmax())                    # fallback
+        _jsel[i] = js
+    out["tau_knee"] = taus[_jsel]
 
     out["_at_edge"] = at_edge
     return out, valid

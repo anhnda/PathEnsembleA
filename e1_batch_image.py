@@ -596,12 +596,17 @@ def main():
                 for i in range(len(_imgs)):
                     adaptive_sigma_per_image[i][name] = float(_t[i])
 
-            # --- KNEE OVERRIDE: Kneedle chuan tren (index, f_b), PER-IMAGE ---
-            # selection_rules dinh nghia tau_knee = argmax do-doc cua f_b (khoang tut
-            # manh nhat). Day KHONG phai Kneedle. Kneedle that = chuan hoa (index, f_b)
-            # ve [0,1], f_b GIAM => knee = diem xa duong cheo nhat: argmax (1-x_hat) - y_hat.
-            # Truc x = INDEX cua sweep (grid log-deu => i ∝ log sigma), PER-IMAGE vi
-            # b_sigma(x) phu thuoc x. Ghi de len 'knee' o tren.
+            # --- KNEE OVERRIDE: Kneedle 'knee DAU', PER-IMAGE ---
+            # Kneedle = chuan hoa (index, f_b) ve [0,1], f_b GIAM => diem xa duong cheo
+            # nhat: d[j] = (1-x_hat[j]) - y_hat[j]. Truc x = INDEX sweep (grid log-deu).
+            # 'knee DAU' thay vi argmax TOAN CUC: voi duong hai-uon (f_b tut, doi len,
+            # tut lai — vd anh co hai cau truc o hai scale), argmax co the nhay sang
+            # dinh SAU. Lay DINH CUC BO DAU TIEN cua d de bat cu knee dau.
+            # Hai chan chong nhieu:
+            #   (a) chi xet index >= KNEE_MIN_FRAC * T  (bo vung dau grid lang tang)
+            #   (b) dinh phai cao hon lan can >= KNEE_DELTA (thang d da chuan hoa [0,1])
+            # Fallback: neu khong co dinh hop le -> argmax d tren [j0:].
+            KNEE_MIN_FRAC, KNEE_DELTA = 0.20, 0.02
             _fb = curve_pp["rho"] * curve_pp["f_x"][:, None]        # (M,T) f(b) per-image
             _M, _T = _fb.shape
             _sg = curve_pp["taus"]                                  # (T,) = sig_grid
@@ -609,10 +614,18 @@ def main():
             _rng = (_fb.max(dim=1, keepdim=True).values - _lo).clamp_min(1e-12)
             _yh = (_fb - _lo) / _rng                                # (M,T) giam ~1 -> 0
             _xh = torch.arange(_T, device=_fb.device).float() / max(_T - 1, 1)   # (T,)
-            _kscore = (1.0 - _xh)[None] - _yh                       # (M,T)
-            _j_knee = _kscore.argmax(dim=1)                         # (M,) diem xa cheo nhat
+            _d = (1.0 - _xh)[None] - _yh                            # (M,T) khoang cach toi cheo
+            _j0 = max(1, int(math.ceil(KNEE_MIN_FRAC * _T)))
+            _dn = _d.detach().cpu().numpy()
             for i in range(_M):
-                adaptive_sigma_per_image[i]["knee"] = float(_sg[_j_knee[i]])
+                di = _dn[i]; jsel = None
+                for j in range(_j0, _T - 1):
+                    if di[j] >= di[j-1] and di[j] > di[j+1] \
+                       and (di[j] - min(di[j-1], di[j+1])) >= KNEE_DELTA:
+                        jsel = j; break                            # dinh cuc bo DAU TIEN
+                if jsel is None:                                   # fallback: argmax tren [j0:]
+                    jsel = _j0 + int(di[_j0:].argmax())
+                adaptive_sigma_per_image[i]["knee"] = float(_sg[jsel])
         _rules_found = sorted({r for d in adaptive_sigma_per_image for r in d})
         if _rules_found:
             print(f"[i] Shrinkage-Adaptive rule: {', '.join(_rules_found)} "

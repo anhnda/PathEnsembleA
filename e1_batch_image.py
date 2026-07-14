@@ -91,6 +91,12 @@ def parse_args():
                     help="in bang tich luy moi bao nhieu anh (0 = tat, chi in cuoi)")
     ap.add_argument("--paired_ref", type=str, default=None,
                     help="method lam moc paired-test; mac dinh = Shrinkage-IG sigma tot nhat")
+    ap.add_argument("--adaptive_oracle", action="store_true",
+                    help="Shrinkage-Adaptive-oracle: moi anh chon sigma cho I-D THAT cao nhat "
+                         "tren grid (--oracle_grid hoac sigma_sweep). TRAN TREN, dat do cham "
+                         "ins/del cho MOI sigma => cham. Chi de do headroom.")
+    ap.add_argument("--oracle_grid", type=float, nargs="+", default=None,
+                    help="grid sigma cho oracle (mac dinh = sigma_sweep). Dense hon => tran chat hon.")
     return ap.parse_args()
 
 
@@ -662,6 +668,35 @@ def main():
                 "insertion": r["insertion_auc"], "deletion": r["deletion_auc"],
                 "id_gap": r["id_gap"],
             })
+        # --- Shrinkage-Adaptive-oracle: TRAN TREN. Moi anh chon sigma cho I-D
+        #     THAT cao nhat tren grid. KHONG phai rule (nhin ket qua metric de chon)
+        #     => chi de DO headroom, khong phai method trien khai duoc. Dat vi phai
+        #     cham ins/del cho MOI sigma trong grid.
+        if getattr(args, "adaptive_oracle", False):
+            o_grid = args.oracle_grid if args.oracle_grid else args.sigma_sweep
+            o_best_id, o_best_ins, o_best_del, o_best_sig = -1e9, None, None, None
+            for _sg in o_grid:
+                _ref = spectral_reference_fft(x, sigma=float(_sg))
+                _a = ig_single(x, _ref, grad_fn, T=args.N)
+                _r = insertion_deletion(model, x, _a, target, device=device,
+                                        steps=args.insdel_steps, substrate=args.substrate,
+                                        batch=args.chunk, score=args.score)
+                if _r["id_gap"] > o_best_id:
+                    o_best_id = _r["id_gap"]; o_best_ins = _r["insertion_auc"]
+                    o_best_del = _r["deletion_auc"]; o_best_sig = float(_sg)
+            om = "Shrinkage-Adaptive-oracle"
+            if om not in acc:
+                acc[om] = {"ins": [], "del": [], "id": []}
+                if om not in metric_names:
+                    metric_names.append(om)
+            acc[om]["ins"].append(o_best_ins); acc[om]["del"].append(o_best_del)
+            acc[om]["id"].append(o_best_id); img_ids[om] = o_best_id
+            per_image_rows.append({
+                "image": os.path.basename(path), "target": target, "method": om,
+                "insertion": o_best_ins, "deletion": o_best_del, "id_gap": o_best_id,
+                "oracle_sigma": o_best_sig,
+            })
+
         id_per_image.append(img_ids)
         best_m = max(img_ids, key=img_ids.get)
         print(f"[{ip+1}/{len(paths)}] {os.path.basename(path):<24} best={best_m} ({img_ids[best_m]:.3f})")

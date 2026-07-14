@@ -363,7 +363,7 @@ def selection_rules(curve: dict, eps: float = 0.05):
     #     (a) index >= KNEE_MIN_FRAC * T  (bo vung dau grid lang tang)
     #     (b) dinh cao hon lan can >= KNEE_DELTA
     #   Fallback: argmax d tren [j0:].  Bat duoc knee DAU cua duong hai-uon.
-    KNEE_MIN_FRAC, KNEE_DELTA = 0.20, 0.02
+    KNEE_MIN_FRAC, KNEE_DELTA = 0.10, 0.02
     f_b = curve["rho"] * curve["f_x"][:, None]                    # (M,T) f(b) PER-INPUT
     _lo = f_b.min(dim=1, keepdim=True).values
     _rng = (f_b.max(dim=1, keepdim=True).values - _lo).clamp_min(1e-12)

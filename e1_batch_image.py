@@ -606,7 +606,7 @@ def main():
             #   (a) chi xet index >= KNEE_MIN_FRAC * T  (bo vung dau grid lang tang)
             #   (b) dinh phai cao hon lan can >= KNEE_DELTA (thang d da chuan hoa [0,1])
             # Fallback: neu khong co dinh hop le -> argmax d tren [j0:].
-            KNEE_MIN_FRAC, KNEE_DELTA = 0.20, 0.02
+            KNEE_MIN_FRAC, KNEE_DELTA = 0.10, 0.02
             _fb = curve_pp["rho"] * curve_pp["f_x"][:, None]        # (M,T) f(b) per-image
             _M, _T = _fb.shape
             _sg = curve_pp["taus"]                                  # (T,) = sig_grid

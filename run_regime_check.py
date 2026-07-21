@@ -17,7 +17,7 @@ import os
 import torch
 import tau_regime as tr
 
-UP = "."
+UP = "/mnt/user-data/uploads"
 
 
 def wine_sigma_eigenvalues():

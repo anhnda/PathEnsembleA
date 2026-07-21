@@ -417,7 +417,22 @@ def main():
 
         rules, valid_m = tau_diag.selection_rules(curve, eps=args.diag_eps)
         tau_diag.print_rules_table(rules, valid=valid_m)
-        tau_diag.dump_curve_csv(curve, f"e1_nlp_{args.dataset}_taucurve.csv")
+        _tc = f"e1_nlp_{args.dataset}_taucurve.csv"
+        tau_diag.dump_curve_csv(curve, _tc)
+
+        # --- TAU-REGIME CHECK (voi NO_SIGNAL guard: NLP thuong thua IG-zero) ---
+        try:
+            import tau_regime as _tr
+            _summ = f"e1_nlp_{args.model}_{args.dataset}_summary.csv"
+            import os as _os
+            _res = _tr.check_match(
+                ref_s=ref.s, curve_path=_tc, metric="soft_gap",
+                summary_path=_summ if _os.path.exists(_summ) else None,
+                summary_metric="soft_gap_mean", zero_name="IG-zero",
+                tag=f"nlp/{args.dataset}")
+            _tr.print_regime_check(_res)
+        except Exception as _e:
+            print(f"[!] tau_regime check bo qua: {_e}")
 
     # ---- accumulators ----
     metric_keys = ["soft_nc", "soft_ns", "soft_logodds"]

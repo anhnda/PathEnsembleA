@@ -795,6 +795,20 @@ def main():
         _td.print_rules_table(rules, valid=valid_m)
         _td.dump_curve_csv(curve, "e1_image_sigmacurve.csv")
 
+        # --- TAU-REGIME CHECK: image = truong hop Fourier (Cor. 2) ---
+        # "Pho cua Sigma" o vision = pho CONG SUAT Fourier (1/f^2), KHONG phai
+        # eigenvalue cua covariance pixel. PR tinh tren pho cong suat do.
+        try:
+            import tau_regime as _tr
+            _X = torch.stack([p_ for p_, _ in diag_pool], 0)     # (M,3,H,W)
+            _P = torch.fft.rfft2(_X, dim=(-2, -1)).abs().pow(2)
+            _P = _P.mean(dim=(0, 1)).flatten().detach().cpu()    # power per freq bin
+            _res = _tr.check_match(ref_s=_P, curve_path="e1_image_sigmacurve.csv",
+                                   tag="image")
+            _tr.print_regime_check(_res)
+        except Exception as _e:
+            print(f"[!] tau_regime check bo qua: {_e}")
+
         # baseline CO DINH len CUNG TRUC (black/white/noise/mean/blur)
         _td.print_fixed_header()
         for nm, bfn in [("IG-black", lambda x: make_fixed_baselines(x, device, args.seed)[1][0]),
@@ -858,7 +872,7 @@ def main():
         print("\n[i] da luu -> e1_image_paired.csv")
 
     with open("e1_image_results.csv", "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["image", "target", "method", "insertion", "deletion", "id_gap", "oracle_sigma"], extrasaction="ignore")
+        w = csv.DictWriter(f, fieldnames=["image", "target", "method", "insertion", "deletion", "id_gap"])
         w.writeheader(); w.writerows(per_image_rows)
     with open("e1_image_summary.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(summary_rows[0].keys()))

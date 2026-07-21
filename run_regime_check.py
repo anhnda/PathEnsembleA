@@ -67,7 +67,7 @@ def main():
 
     # ---------------- NLP ----------------
     summ_n = os.path.join(UP, "e1_nlp_distilbert_sst2_summary.csv")
-    curve_n = os.path.join(UP, "e1_nlp_distilbert_sst2_taucurve.csv")
+    curve_n = os.path.join(UP, "e1_nlp_sst2_taucurve.csv")
     if os.path.exists(curve_n):
         res_n = tr.check_match(ref_s=None, curve_path=curve_n,
                                metric="soft_gap",

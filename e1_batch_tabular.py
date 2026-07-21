@@ -431,7 +431,17 @@ def main():
 
         # (6) CSV long-format — de fit rule offline, dung suy dien tu 4 diem nua
         extra = {"id_gap": curve["_id_per_tau"]} if "_id_per_tau" in curve else None
-        tau_diag.dump_curve_csv(curve, f"e1_tabular_{args.dataset}_taucurve.csv", extra_cols=extra)
+        _tc = f"e1_tabular_{args.dataset}_taucurve.csv"
+        tau_diag.dump_curve_csv(curve, _tc, extra_cols=extra)
+
+        # --- TAU-REGIME CHECK: PR du doan tau-sensitivity co khop curve khong ---
+        try:
+            import tau_regime as _tr
+            _res = _tr.check_match(ref_s=ref.s, curve_path=_tc, metric="id_gap",
+                                   tag=f"tabular/{args.dataset}")
+            _tr.print_regime_check(_res)
+        except Exception as _e:
+            print(f"[!] tau_regime check bo qua: {_e}")
 
     # =====================================================================
     # tau* CLOSED FORM — bo tau khoi danh sach sieu tham so.

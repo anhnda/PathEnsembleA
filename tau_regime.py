@@ -57,22 +57,58 @@ def pr_fraction(s: torch.Tensor) -> float:
     return participation_ratio(s) / s.numel()
 
 
-# nguong: PR/D < 0.5 => tap trung => du doan PHANG.  >= 0.5 => trai dai => du doan SAC.
-# 0.5 la ranh gioi CO THE TRANH CAI. Chon vi:
-#   wine PR/D = 4.57/13 = 0.352  -> concentrated -> flat  (khop t=0.68)
-#   anh 1/f^2 PR/D lon (pho trai) -> spread -> sharp     (khop rate rule work)
-# Neu co diem trung gian (PR/D ~ 0.5) ma sensitivity KHONG chuyen tiep muot
-# => nguong 0.5 sai HOAC PR khong phai truc dung. Bao ro.
-PR_FRAC_THRESHOLD = 0.5
+# =============================================================================
+# CANH BAO — PR DA BI FALSIFY LAM PREDICTOR (2026-07)
+#
+# Gia thuyet ban dau: PR/D thap => flat, cao => sharp. KIEM TREN 6 diem:
+#
+#   dataset   known   PR/D      sd(log s)   ket luan
+#   -------------------------------------------------
+#   wine      flat    39.3%     0.99        PR dung
+#   bcancer   flat    12.9%     1.29        PR dung
+#   digits    flat    29.8%     1.06        PR dung
+#   iris      sharp*  43.5%     0.78        PR SAI (nhung sharp la NHIEU low-D)
+#   image     sharp    0.04%    3.88        PR SAI HAN (concentrated ma sharp!)
+#
+# => KHONG co nguong PR/D nao tach duoc sharp khoi flat. Anh 1/f^2 co PR/D CUC THAP
+#    (power don vao vai bin tan so thap) NHUNG lai sharp — NGUOC HAN wine. Va iris
+#    "sharp" thuc ra la curve NHIEU (D=4, t=2.98 nhung khong co knee, chi bounce).
+#
+# sd(log s) tach image (3.88) ra duoc nhung iris (0.78) van pha. KHONG summary pho
+# nao doan dung tau-sensitivity xuyen modality.
+#
+# KET LUAN CHO PAPER: KHONG claim "PR (hay pho) du doan tau matters". Thay vao do:
+#   - DO tau-sensitivity truc tiep bang efficiency curve (forward-only, re).
+#   - Bao PR nhu mot predictor DA THU VA THAT BAI (falsification-first).
+#
+# predict_regime() VAN tinh PR + sd(log s) DE GHI LAI, nhung tra ve
+# 'regime_predicted' = None va co (khong con nguong). check_match() vi vay se
+# lay regime DO DUOC lam su that, va bao PR-vs-do-duoc nhu MOT PHEP THU, khong
+# phai matching diagnostic.
+# =============================================================================
+PR_FRAC_THRESHOLD = 0.5   # GIU LAI chi de tham chieu; KHONG con dung de phan loai.
+
+
+def sd_log_spectrum(s: torch.Tensor) -> float:
+    """Do trai cua log-pho (nats). Cao => trai nhieu decade. Da thu lam predictor: van pha o iris."""
+    s = s.clamp_min(1e-12).double()
+    ls = s.log()
+    w = s / s.sum()
+    m = (w * ls).sum()
+    return float(((w * ls.pow(2)).sum() - m.pow(2)).clamp_min(0).sqrt().item())
 
 
 def predict_regime(s: torch.Tensor) -> dict:
-    """Du doan che do tau CHI tu pho. Chua nhin metric."""
-    prf = pr_fraction(s)
-    regime = "sharp" if prf >= PR_FRAC_THRESHOLD else "flat"
-    return {"PR": participation_ratio(s), "D": int(s.numel()), "PR_frac": prf,
-            "regime_predicted": regime,
-            "tau_matters_predicted": (regime == "sharp")}
+    """
+    GHI LAI so lieu pho (PR, sd log s). KHONG con doan regime — da falsify.
+    'regime_predicted' = None de check_match bao PARTIAL/FALSIFICATION-TEST thay vi
+    gia vo co du doan tin cay.
+    """
+    return {"PR": participation_ratio(s), "D": int(s.numel()),
+            "PR_frac": pr_fraction(s), "sd_log_s": sd_log_spectrum(s),
+            "regime_predicted": None,          # <- da bo: PR khong doan duoc
+            "tau_matters_predicted": None,
+            "PR_naive_guess": "flat" if pr_fraction(s) < PR_FRAC_THRESHOLD else "sharp"}
 
 
 # ---------------------------------------------------------------------------
@@ -225,13 +261,16 @@ def check_match(ref_s: torch.Tensor | None, curve_path: str | None,
     if curve_path:
         res["measure"] = measure_sensitivity(curve_path, metric=metric)
 
-    # 3) so khop
-    if "predict" in res and "measure" in res:
-        rp = res["predict"]["regime_predicted"]
-        rm = res["measure"]["regime_measured"]
-        res["status"] = "MATCH" if rp == rm else "MISMATCH"
+    # 3) DO DUOC la su that. PR chi la phep THU (da falsify).
+    if "measure" in res:
+        res["status"] = "MEASURED"                    # co regime do duoc
+        if "predict" in res:
+            # PR-naive-guess co trung voi do duoc khong? (chi de ghi lai, KHONG ket luan)
+            guess = res["predict"]["PR_naive_guess"]
+            meas = res["measure"]["regime_measured"]
+            res["pr_test"] = "AGREE" if guess == meas else "DISAGREE"
     else:
-        res["status"] = "PARTIAL"  # thieu mot ve
+        res["status"] = "PARTIAL"                      # khong co curve
     return res
 
 
@@ -248,36 +287,32 @@ def print_regime_check(res: dict):
         print(f"[!!]  Bao cao rieng: day la thua ve MODEL/METRIC, khong phai ve chon tau.")
         return
 
-    if "predict" in res:
-        p = res["predict"]
-        print(f"[i] DU DOAN (tu pho): PR = {p['PR']:.2f} / D = {p['D']}  "
-              f"(PR/D = {p['PR_frac']*100:.1f}%)")
-        print(f"[i]   PR/D {'>=' if p['PR_frac']>=PR_FRAC_THRESHOLD else '<'} "
-              f"{PR_FRAC_THRESHOLD:.0%}  =>  regime = '{p['regime_predicted'].upper()}'  "
-              f"(tau {'MATTERS' if p['tau_matters_predicted'] else 'is ROBUST'})")
-
+    # DO DUOC = su that
     if "measure" in res:
         m = res["measure"]
         if m.get("mode") == "metric":
-            print(f"[i] DO DUOC (tu curve, metric={m['metric']}, n={m['n']}):")
-            print(f"[i]   argmax tau = {m['argmax_tau']:.3g}, interior gain over endpoints = "
-                  f"{m['interior_gain']:+.4f}")
-            print(f"[i]   paired t (argmax-tau vs endpoint) = {m['t_stat_vs_endpoint']:.2f}  "
-                  f"=>  regime = '{m['regime_measured'].upper()}'")
+            print(f"[i] DO DUOC (curve, metric={m['metric']}, n={m['n']}):  "
+                  f"regime = '{m['regime_measured'].upper()}'")
+            print(f"[i]   argmax tau={m['argmax_tau']:.3g}, interior gain={m['interior_gain']:+.4f}, "
+                  f"paired t vs endpoint={m['t_stat_vs_endpoint']:.2f}")
         else:
-            print(f"[i] DO DUOC (saturation proxy, n={m['n']}):")
-            print(f"[i]   Δf bao hoa @tau={m['df_sat_tau']:.3g}, dist bao hoa @tau={m['dist_sat_tau']:.3g}")
-            print(f"[i]   {'Δf-first => KNEE' if m['regime_measured']=='sharp' else 'dist-first => FLAT'}"
-                  f"  =>  regime = '{m['regime_measured'].upper()}'")
+            print(f"[i] DO DUOC (saturation proxy, n={m['n']}):  "
+                  f"regime = '{m['regime_measured'].upper()}'")
+            print(f"[i]   Δf bao hoa @tau={m['df_sat_tau']:.3g}, dist @tau={m['dist_sat_tau']:.3g}")
 
-    if st == "MATCH":
-        print(f"[OK] MATCH: du doan PR va sensitivity do duoc TRUNG KHOP.")
-    elif st == "MISMATCH":
-        print(f"[!!] MISMATCH: PR du doan '{res['predict']['regime_predicted']}' nhung do duoc "
-              f"'{res['measure']['regime_measured']}'.")
-        print(f"[!!]  => PR KHONG phai truc dung o day, HOAC nguong {PR_FRAC_THRESHOLD} sai. FALSIFICATION.")
-    else:
-        print(f"[i] PARTIAL: thieu mot ve (pho hoac curve). Cung cap ca hai de so khop.")
+    # PHO = ghi lai + phep THU PR (da falsify)
+    if "predict" in res:
+        p = res["predict"]
+        print(f"[i] PHO (ghi lai): PR={p['PR']:.2f}/D={p['D']} (PR/D={p['PR_frac']*100:.2f}%), "
+              f"sd(log s)={p['sd_log_s']:.3f}")
+        if "pr_test" in res:
+            print(f"[i]   PR-naive-guess = '{p['PR_naive_guess']}'  vs do duoc "
+                  f"'{res['measure']['regime_measured']}'  ->  PR test: {res['pr_test']}")
+            if res["pr_test"] == "DISAGREE":
+                print(f"[!!]  PR SAI o day (da biet: PR khong doan duoc tau-sensitivity xuyen modality).")
+
+    if st == "PARTIAL":
+        print(f"[i] PARTIAL: chua co curve => chua do duoc regime. Chay batch script de sinh curve.")
 
 
 # ---------------------------------------------------------------------------
@@ -285,48 +320,44 @@ def print_regime_check(res: dict):
 # ---------------------------------------------------------------------------
 def print_pr_sensitivity_law(entries: list[dict]):
     """
-    entries: list cac dict tu check_match() da co ca predict+measure.
-    In bang PR/D vs interior_gain de kiem LUAT: sensitivity co tang theo PR khong?
+    Bang FALSIFICATION: PR (va sd log s) co doan dung regime DO DUOC khong?
 
-    2 diem = mot duong thang qua 2 cham. Can >= 4 diem trai PR de goi la LUAT.
-    Ham nay in ro con THIEU bao nhieu diem.
+    KET QUA da biet (6 diem): KHONG. Ham nay in bang de nguoi doc TU THAY:
+    khong nguong PR/D nao tach sharp/flat, va sd(log s) cung pha o iris.
+    Ket luan cho paper: DO tau-sensitivity truc tiep, dung DU DOAN tu pho.
     """
-    print(f"\n=== LUAT PR -> TAU-SENSITIVITY (can >= 4 diem) ===")
-    print(f"{'modality':<16}{'PR/D':>8}{'regime_pred':>14}{'gain_measured':>15}{'regime_meas':>14}{'match':>8}")
-    print("-" * 76)
-    pts = []
+    print(f"\n=== FALSIFICATION: PHO CO DOAN DUOC TAU-SENSITIVITY KHONG? ===")
+    print(f"{'modality':<14}{'PR/D':>9}{'sd(logs)':>10}{'PR-guess':>10}"
+          f"{'gain':>10}{'MEASURED':>10}{'PR test':>10}")
+    print("-" * 73)
+    agree = 0; total = 0
     for e in entries:
         tag = e.get("tag", "?")
         if e["status"] == "NO_SIGNAL":
-            print(f"{tag:<16}{'-':>8}{'-':>14}{'NO_SIGNAL':>15}{'-':>14}{'-':>8}")
+            print(f"{tag:<14}{'-':>9}{'-':>10}{'-':>10}{'NO_SIGNAL':>10}{'-':>10}{'-':>10}")
             continue
-        prf = e.get("predict", {}).get("PR_frac")
-        rp = e.get("predict", {}).get("regime_predicted", "-")
-        meas = e.get("measure", {})
-        gain = meas.get("interior_gain")
-        rm = meas.get("regime_measured", "-")
+        p = e.get("predict", {})
+        m = e.get("measure", {})
+        prf = p.get("PR_frac"); sdl = p.get("sd_log_s")
+        guess = p.get("PR_naive_guess", "-")
+        gain = m.get("interior_gain"); rm = m.get("regime_measured", "-")
+        test = e.get("pr_test", "-")
         prf_s = f"{prf*100:.1f}%" if prf is not None else "-"
+        sdl_s = f"{sdl:.2f}" if sdl is not None else "-"
         gain_s = f"{gain:+.4f}" if gain is not None else "(proxy)"
-        print(f"{tag:<16}{prf_s:>8}{rp:>14}{gain_s:>15}{rm:>14}{e['status']:>8}")
-        if prf is not None and gain is not None:
-            pts.append((prf, gain))
-    print("-" * 76)
-    n = len(pts)
-    if n >= 2:
-        # spearman tho tren (PR/D, gain)
-        xs = sorted(range(n), key=lambda i: pts[i][0])
-        ys = sorted(range(n), key=lambda i: pts[i][1])
-        rx = [0]*n; ry = [0]*n
-        for r, i in enumerate(xs): rx[i] = r
-        for r, i in enumerate(ys): ry[i] = r
-        dsq = sum((rx[i]-ry[i])**2 for i in range(n))
-        rho = 1 - 6*dsq/(n*(n*n-1)) if n > 2 else float("nan")
-        print(f"[i] {n} diem co ca PR va gain. Spearman(PR/D, interior_gain) = {rho:.3f}"
-              if n > 2 else f"[i] chi {n} diem — chua tinh duoc correlation.")
-    if n < 4:
-        print(f"[!!] CHI {n} DIEM. 'PR du doan sensitivity' con la duong qua {n} cham, CHUA phai luat.")
-        print(f"[!!]  Can them {4-n} dataset trai PR (nhat la vung trung gian PR/D ~ 0.5) truoc khi")
-        print(f"[!!]  claim monotonic trong paper. Nếu KHÔNG monotonic khi them diem => PR sai truc.")
+        print(f"{tag:<14}{prf_s:>9}{sdl_s:>10}{guess:>10}{gain_s:>10}{rm:>10}{test:>10}")
+        if test in ("AGREE", "DISAGREE"):
+            total += 1
+            agree += (test == "AGREE")
+    print("-" * 73)
+    if total:
+        print(f"[i] PR-naive-guess trung do duoc: {agree}/{total}.")
+        if agree < total:
+            print(f"[!!] PR DISAGREE o {total-agree}/{total} diem => PR KHONG phai predictor tin cay.")
+            print(f"[!!]  Cu the: anh 1/f^2 co PR/D CUC THAP nhung SHARP (nguoc wine).")
+            print(f"[!!]  => PAPER: DO tau-sensitivity bang efficiency curve, KHONG doan tu pho.")
+    else:
+        print(f"[i] chua co diem nao co ca pho + curve do duoc. Chay batch scripts truoc.")
 
 
 if __name__ == "__main__":

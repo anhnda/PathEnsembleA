@@ -858,7 +858,7 @@ def main():
         print("\n[i] da luu -> e1_image_paired.csv")
 
     with open("e1_image_results.csv", "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["image", "target", "method", "insertion", "deletion", "id_gap"])
+        w = csv.DictWriter(f, fieldnames=["image", "target", "method", "insertion", "deletion", "id_gap", "oracle_sigma"], extrasaction="ignore")
         w.writeheader(); w.writerows(per_image_rows)
     with open("e1_image_summary.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(summary_rows[0].keys()))

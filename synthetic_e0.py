@@ -299,6 +299,37 @@ def ig_tabular(x, x0, grad_fn, T=64):
     return g.mean(dim=0) * (x - x0)                                      # (D,)
 
 
+def diffusion_ig_tabular(x, ref, grad_fn, taus, mu=None):
+    """
+    DiffusionIG (grid-free Blur-IG): tich phan gradient doc DUONG tau cua shrinkage
+    baseline, tu tau=inf (mean) -> tau=0 (input). KHONG chon tau — tich phan het.
+
+    b_tau = mu + V diag(s/(s+tau)) V^T (x-mu).  Duong di khi tau giam: mean -> x.
+    Attribution = sum_j grad F(b_j) * (b_{j-1} - b_j)   [telescoping, khop Blur-IG:
+      gradient tai moi diem tren path * do dich chuyen cua baseline o buoc do].
+
+    taus: tensor giam dan (vd logspace(hi..lo) roi them 0). x: (D,). Tra ve (D,).
+    Day la analogue coordinate-free cua Blur-IG: 'scale' = tau (diffusion time cua
+    precision operator), chay o MOI modality co Sigma, khong can grid.
+    """
+    device = x.device
+    taus = torch.as_tensor(taus, device=device, dtype=x.dtype)
+    taus, _ = torch.sort(taus, descending=True)                 # tu lon (gan mean) -> nho (gan x)
+    tlist = list(taus.tolist())
+    # neo hai dau CHINH XAC: pts[0] = mean (tau=inf), pts[-1] = x (tau=0) => completeness dung.
+    pts = [ref.mu.clone() if mu is None else mu.clone()]        # b(tau=inf) = mean
+    for t in tlist:
+        pts.append(shrinkage_baseline(x, ref, tau=float(t)))
+    pts.append(x.clone())                                       # b(tau=0) = x
+    pts = torch.stack(pts, 0)                                    # (P,D): mean ... x
+    # gradient tai TRUNG DIEM moi doan (midpoint) cho on dinh
+    mids = 0.5 * (pts[:-1] + pts[1:])                            # (P-1,D)
+    g = grad_fn(mids)                                            # (P-1,D)
+    disp = pts[1:] - pts[:-1]                                    # (P-1,D) do dich moi doan
+    attr = (g * disp).sum(dim=0)                                 # (D,) tich phan doc path
+    return attr
+
+
 def eg_tabular(x, baselines, grad_fn, N):
     """EG: trung binh IG tren pool baseline (baselines: (K,D)), ngan sach chia deu."""
     K = baselines.shape[0]

@@ -220,6 +220,43 @@ def ig_embedding(fwd, model, word_embed, base_embed, position_embed, type_embed,
     return attr_token, attr_full
 
 
+def diffusion_ig_embedding(fwd, model, word_embed, ref, position_embed, type_embed,
+                           attention_mask, pred_class, taus):
+    """
+    DiffusionIG tren EMBEDDING (grid-free Blur-IG cho NLP): tich phan gradient doc
+    DUONG tau cua shrinkage baseline, tu tau=inf (mean-embedding) -> tau=0 (word_embed).
+    KHONG chon tau. 'scale' = tau = diffusion time cua precision embedding-space.
+
+    Path: pts[0]=mu (per-token posterior-mean tai tau=inf) ... pts[-1]=word_embed.
+    attr = sum_j grad F(mid_j) * (pts[j+1]-pts[j])  (telescoping, completeness dung).
+    Tra ve (attr_token (seq,), attr_full (1,seq,d)).
+    """
+    from synthetic_e0 import shrinkage_baseline
+    device = word_embed.device
+    we = word_embed[0]                                       # (seq,d)
+    taus = torch.as_tensor(taus, device=device, dtype=we.dtype)
+    taus, _ = torch.sort(taus, descending=True)
+    # neo hai dau: mean-embedding (tau=inf) va word_embed (tau=0)
+    mu_emb = ref.mu[None].expand_as(we)                     # (seq,d) posterior mean tai tau=inf
+    pts = [mu_emb.clone()]
+    for t in taus.tolist():
+        pts.append(shrinkage_baseline(we, ref, tau=float(t)))   # (seq,d) per-token
+    pts.append(we.clone())
+    pts = torch.stack(pts, 0)                                # (P,seq,d): mean ... word_embed
+
+    attr_full = torch.zeros_like(word_embed)                # (1,seq,d)
+    for j in range(pts.shape[0] - 1):
+        mid = (0.5 * (pts[j] + pts[j + 1]))[None]           # (1,seq,d)
+        emb = mid.clone().requires_grad_(True)
+        logits = fwd(model, emb, attention_mask=attention_mask,
+                     position_embed=position_embed, type_embed=type_embed)
+        g, = torch.autograd.grad(logits[0, pred_class], emb)
+        disp = (pts[j + 1] - pts[j])[None]                  # (1,seq,d)
+        attr_full += g.detach() * disp
+    attr_token = attr_full.sum(dim=-1).squeeze(0)           # (seq,)
+    return attr_token, attr_full
+
+
 @torch.no_grad()
 def insdel_marginal_nlp(fwd, model, word_embed, position_embed, type_embed,
                         attention_mask, attr_token, pred_class, ref_pool,
@@ -369,7 +406,15 @@ def main():
     methods = ["IG-zero", "IG-pad", "IG-mask", "IG-mean", "IG-random"]
     methods += [f"EG-{K}" for K in args.eg_K]
     methods += [f"Shrinkage-IG@{t:g}" for t in args.tau_sweep]
-    methods += ["PM-IG-PPCA"]
+    methods += ["PM-IG-PPCA", "DiffusionIG"]
+
+    # tau-grid cho DiffusionIG (NLP): phu dai eigenvalue cua Sigma embedding.
+    _s_nlp = ref.s
+    _thi = float(_s_nlp.max().item()) * 50.0
+    _tlo = float(_s_nlp.min().clamp_min(1e-6).item()) * 0.02
+    _diffusion_taus_nlp = torch.logspace(
+        torch.log10(torch.tensor(_thi)), torch.log10(torch.tensor(_tlo)),
+        steps=20, device=device)
     if args.rivals:
         methods += ["IG-MaxEnt", "FRInGe", "IG2"]
 
@@ -624,10 +669,12 @@ def main():
                                          attn, pred_class, steps_k)
                     attr_full_acc += af
                 attr_full = attr_full_acc / K
+            elif nm == "DiffusionIG":
+                # tich phan doc DUONG tau (mean-embedding -> word_embed). KHONG chon tau.
+                _, attr_full = diffusion_ig_embedding(
+                    fwd, model, word_embed, ref, position_embed, type_embed,
+                    attn, pred_class, taus=_diffusion_taus_nlp)
             else:
-                be = baseline_embed_for(nm, word_embed)
-                _, attr_full = ig_embedding(fwd, model, word_embed, be, position_embed, type_embed,
-                                            attn, pred_class, args.steps)
 
                 # --- DEBUG: baseline strength f(x) vs f(baseline) (softmax pred_class) ---
                 with torch.no_grad():

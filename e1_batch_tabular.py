@@ -14,6 +14,7 @@ Chi giu IG + BASELINE (path thang, dung E1):
 
 Dung LAI estimator/IG/metric tu synthetic_e0.py (khong lap code):
     fit_reference, shrinkage_baseline, fit_ppca, ig_tabular, eg_tabular,
+    diffusion_ig_tabular,
     fit_imputer, insertion_deletion_tabular, score_target, make_tabular_gradfn, MLP-train.
 
 Dataset: sklearn offline (breast_cancer / wine / digits). Nhan da co san -> classif,
@@ -262,6 +263,9 @@ def main():
             return ig_tabular(x, shrinkage_baseline(x, ref, tau=tau), grad_fn, T=N)
         if name == "PM-IG-PPCA":
             return ig_tabular(x, shrinkage_baseline(x, ppca_ref, tau=psi), grad_fn, T=N)
+        if name == "DiffusionIG":
+            # tich phan doc DUONG tau (mean->x), KHONG chon tau. Grid-free Blur-IG.
+            return diffusion_ig_tabular(x, ref, grad_fn, taus=_diffusion_taus, mu=mu)
         # --- doi trong ---
         if name == "IG-MaxEnt":
             b = max_entropy_baseline_tab(model, x, n_class, steps=args.me_steps)
@@ -290,6 +294,8 @@ def main():
             return shrinkage_baseline(x, ref, tau=float(name.split("@")[1]))
         if name == "PM-IG-PPCA":
             return shrinkage_baseline(x, ppca_ref, tau=psi)
+        if name == "DiffusionIG":
+            return None                      # path method, khong 1 diem baseline
         # --- doi trong: baseline DIEM (de debug strength) ---
         if name == "IG-MaxEnt":
             return max_entropy_baseline_tab(model, x, n_class, steps=args.me_steps)
@@ -501,7 +507,16 @@ def main():
     methods = ["IG-zero", "IG-mean", "IG-median", "IG-random"]
     methods += [f"EG-{K}" for K in args.eg_K]
     methods += [f"Shrinkage-IG@{t:g}" for t in args.tau_sweep]
-    methods += ["PM-IG-PPCA"]
+    methods += ["PM-IG-PPCA", "DiffusionIG"]
+
+    # tau-grid cho DiffusionIG: log-spaced tu gan-mean (lon) ve gan-x (nho), phu
+    # dai eigenvalue cua Sigma. KHONG chon 1 tau — tich phan doc CA duong nay.
+    _s = ref.s
+    _t_hi = float(_s.max().item()) * 50.0     # tau lon => b ~ mean
+    _t_lo = float(_s.min().clamp_min(1e-6).item()) * 0.02   # tau nho => b ~ x
+    _diffusion_taus = torch.logspace(
+        torch.log10(torch.tensor(_t_hi)), torch.log10(torch.tensor(_t_lo)),
+        steps=24, device=device)
     for _r in sorted(adaptive_tau):
         methods.append(f"Shrinkage-Adaptive-{_r}")
     if args.rivals:

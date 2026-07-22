@@ -204,3 +204,93 @@ def spectral_reference_fracheat(x, sigma, beta=1.0):
     Xf = X * c[None]
     xb = torch.fft.irfft2(Xf, s=(H, W), dim=(-2, -1))
     return xb
+
+
+# =============================================================================
+# DIRECT BASELINE — khong sweep, khong metric. Tra baseline TRUC TIEP.
+#
+# Y tuong: baseline = fractional-heat diffusion voi
+#   (1) beta = -alpha/2 do TU pho reference set (1 FFT), va
+#   (2) sigma giai DONG (closed-form) sao cho baseline xoa DUNG mot ti le
+#       variance co dinh (frac) — day la (P2) cua paper luong hoa, khong phai
+#       tim faithfulness-optimal (cai do da chung minh khong closed-form duoc).
+#
+# "Xoa frac variance" trong metric precision: residual giu lai
+#   r(w) = 1 - c(w),  c(w) = exp(-1/2 sigma^2 |w|^{2 beta})
+# Nang luong residual = sum_w S(w) r(w)^2 ; muon = frac * sum_w S(w).
+# Giai sigma bang bisection tren dai n (don dieu theo sigma) — 1 dong, khong
+# dung model, khong dung insertion/deletion.
+# =============================================================================
+def measure_beta(ref_imgs):
+    """
+    ref_imgs: (M,C,H,W) hoac (M,H,W). Do slope alpha cua pho cong suat radial,
+    tra ve beta = -alpha/2. Mot FFT tren reference set. Khong model.
+    """
+    import numpy as _np
+    x = ref_imgs
+    if x.dim() == 4:
+        x = x.mean(1)                                        # gray (M,H,W)
+    M, H, W = x.shape
+    x = x - x.mean(dim=(-2, -1), keepdim=True)
+    P = (torch.fft.fft2(x).abs() ** 2).mean(0)               # (H,W)
+    P = torch.fft.fftshift(P)
+    fy = torch.fft.fftshift(torch.fft.fftfreq(H)).view(H, 1)
+    fx = torch.fft.fftshift(torch.fft.fftfreq(W)).view(1, W)
+    kr = torch.sqrt(fy ** 2 + fx ** 2)
+    nb = min(H, W) // 2
+    edges = torch.linspace(1e-6, kr.max().item(), nb + 1)
+    kc, Sk = [], []
+    for b in range(nb):
+        m = (kr >= edges[b]) & (kr < edges[b + 1])
+        if m.sum() > 0:
+            kc.append(0.5 * (edges[b] + edges[b + 1]).item()); Sk.append(P[m].mean().item())
+    kc, Sk = _np.array(kc), _np.array(Sk)
+    kmin, kmax = kc.max() * 0.05, kc.max() * 0.6
+    m = (kc >= kmin) & (kc <= kmax) & (Sk > 0)
+    A = _np.vstack([_np.log(kc[m]), _np.ones(m.sum())]).T
+    alpha = _np.linalg.lstsq(A, _np.log(Sk[m]), rcond=None)[0][0]
+    return float(-alpha / 2.0), float(alpha)
+
+
+def solve_sigma_varfrac(x, beta, frac=0.5, lo=0.1, hi=64.0, iters=40):
+    """
+    Giai DONG sigma sao cho fractional-heat baseline xoa ~frac ti le variance cua x
+    (trong metric pho). Bisection — don dieu vi sigma lon => xoa nhieu hon.
+    Khong model, khong metric faithfulness. Tra ve sigma (float).
+    """
+    C, H, W = x.shape
+    X = torch.fft.rfft2(x, dim=(-2, -1))
+    fy = torch.fft.fftfreq(H, device=x.device).view(H, 1)
+    fx = torch.fft.rfftfreq(W, device=x.device).view(1, -1)
+    w2 = (2 * torch.pi) ** 2 * (fy ** 2 + fx ** 2)
+    w2b = w2.clamp_min(0) ** beta
+    S = (X.abs() ** 2).sum(0)                                 # nang luong pho per-freq (H,W//2+1)
+    tot = S.sum().clamp_min(1e-12)
+
+    def removed_frac(sig):
+        c = torch.exp(-0.5 * (sig ** 2) * w2b)               # giu
+        r2 = (1.0 - c) ** 2                                   # residual^2 = da xoa
+        return float((S * r2).sum() / tot)
+
+    a, b = lo, hi
+    # dam bao bracket: removed(lo) < frac < removed(hi); neu khong, clamp
+    if removed_frac(a) >= frac:
+        return a
+    if removed_frac(b) <= frac:
+        return b
+    for _ in range(iters):
+        mid = 0.5 * (a + b)
+        if removed_frac(mid) < frac:
+            a = mid
+        else:
+            b = mid
+    return 0.5 * (a + b)
+
+
+def direct_baseline_image(x, beta, frac=0.5):
+    """
+    BASELINE TRUC TIEP: 1 solve sigma (dong) + 1 fractional-heat. Khong sweep.
+    x: (C,H,W). beta do truoc tu measure_beta(reference). Tra ve baseline (C,H,W).
+    """
+    sig = solve_sigma_varfrac(x, beta=beta, frac=frac)
+    return spectral_reference_fracheat(x, sigma=sig, beta=beta), sig

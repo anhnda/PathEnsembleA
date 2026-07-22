@@ -39,7 +39,8 @@ from pea.resnet50_gradfn import (
 )
 from pea.insdel import insertion_deletion
 from pea.methods import ig_single, eg
-from pea.spectral_reference import spectral_reference_fft, spectral_reference_fracheat
+from pea.spectral_reference import (spectral_reference_fft, spectral_reference_fracheat,
+                                    measure_beta, direct_baseline_image)
 from pea.baselines_rival import (
     resnet50_penultimate, ig2_attribution, sample_counterfactual_ref,
     max_entropy_baseline, ig_from_baseline, fringe_attribution,
@@ -78,6 +79,11 @@ def parse_args():
                     help="Neu dat, them baseline IG-fracheat(beta): low-pass e^{-1/2 sig^2 |w|^{2 beta}}. "
                          "beta=1=Gaussian blur; beta do tu precision_laplacian_probe (=-alpha/2). "
                          "Test: fractional-heat co thang Gaussian blur o anh khong.")
+    ap.add_argument("--direct", action="store_true",
+                    help="Them baseline TRUC TIEP: beta do tu pho reference (1 FFT) + sigma giai DONG "
+                         "de xoa --direct_frac variance. KHONG sweep, KHONG metric. 1 baseline/anh.")
+    ap.add_argument("--direct_frac", type=float, default=0.5,
+                    help="ti le variance can xoa cho baseline truc tiep (P2 luong hoa). Mac dinh 0.5.")
     ap.add_argument("--no_fixed", action="store_true", help="bo cac baseline co dinh (chi Shrinkage + EG)")
     # --- doi trong: IG2 / Max-Entropy / FRInGe ---
     ap.add_argument("--rivals", action="store_true",
@@ -213,7 +219,8 @@ def baseline_strength_row(model, x, baseline, target):
 
 def attributions_for_image(x, grad_fn, args, device, seed,
                            model=None, target=None, rep_fn=None, ref_pool=None, n_class=1000,
-                           adaptive_sigma=None, real_bank=None, eg_real=False, cur_idx=None):
+                           adaptive_sigma=None, real_bank=None, eg_real=False, cur_idx=None,
+                           direct_beta=None, direct_frac=0.5):
     """
     Chi IG + baseline (theo E1, path thang). Tra ve dict {method: attr(3,H,W)}.
       - Shrinkage-IG@sigma        : baseline = Wiener low-pass FFT (blur), IG thang toi x.
@@ -234,6 +241,11 @@ def attributions_for_image(x, grad_fn, args, device, seed,
         if args.frac_beta is not None:
             reff = spectral_reference_fracheat(x, sigma=sig, beta=args.frac_beta)
             out[f"IG-fracheat@{sig:g}"] = ig_single(x, reff, grad_fn, T=args.N)
+
+    # --- BASELINE TRUC TIEP: 1 baseline/anh, khong sweep, khong metric ---
+    if direct_beta is not None:
+        b_dir, sig_dir = direct_baseline_image(x, beta=direct_beta, frac=direct_frac)
+        out["IG-direct"] = ig_single(x, b_dir, grad_fn, T=args.N)
 
     # --- Shrinkage-Adaptive: sigma PER-IMAGE do rule chon (sigma_rate / sigma*) ---
     if adaptive_sigma:
@@ -680,6 +692,17 @@ def main():
         print(f"[i] --eg_real: EG lay baseline tu {real_bank.shape[0]} anh THAT trong folder "
               f"(thay vi x+noise).")
 
+    # --- BASELINE TRUC TIEP: do beta TU pho reference set (1 lan, 1 FFT) ---
+    _direct_beta = None
+    if args.direct:
+        _refb = torch.stack([preprocess(Image.open(p), size=224, device=device)
+                             for p in paths[:min(len(paths), 50)]], 0)
+        _direct_beta, _alpha = measure_beta(_refb)
+        print(f"[i] --direct: do tu pho reference: alpha={_alpha:.3f} => beta={_direct_beta:.3f}. "
+              f"Baseline = fractional-heat(beta) + sigma giai dong (xoa {args.direct_frac:.0%} variance). "
+              f"KHONG sweep.")
+        del _refb
+
     for ip, path in enumerate(paths):
         x = preprocess(Image.open(path), size=224, device=device)
         if args.target is None:
@@ -704,7 +727,8 @@ def main():
                                        model=model, target=target, rep_fn=rep_fn,
                                        ref_pool=ref_pool, n_class=n_class,
                                        adaptive_sigma=adaptive_sigma,
-                                       real_bank=real_bank, eg_real=args.eg_real, cur_idx=ip)
+                                       real_bank=real_bank, eg_real=args.eg_real, cur_idx=ip,
+                                       direct_beta=_direct_beta, direct_frac=args.direct_frac)
         if metric_names is None:
             metric_names = list(attrs.keys())
             for m in metric_names:

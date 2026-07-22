@@ -71,6 +71,9 @@ def parse_args():
                     help="so baseline pool cho EG (random sample quanh anh trong khong gian chuan hoa)")
     ap.add_argument("--eg_noise", type=float, default=1.0,
                     help="do lech chuan mau EG (khong gian da chuan hoa)")
+    ap.add_argument("--eg_real", action="store_true",
+                    help="EG lay baseline la ANH THAT tu folder (Expected Gradients chuan, "
+                         "in-distribution) thay vi x+noise. Dung de test manifold-vs-noise.")
     ap.add_argument("--no_fixed", action="store_true", help="bo cac baseline co dinh (chi Shrinkage + EG)")
     # --- doi trong: IG2 / Max-Entropy / FRInGe ---
     ap.add_argument("--rivals", action="store_true",
@@ -133,6 +136,23 @@ def make_eg_pool(x, K, noise, device, seed):
     return x[None] + eps                                   # (K,3,H,W)
 
 
+def make_eg_pool_real(K, real_bank, seed, exclude_idx=None):
+    """
+    Pool K baseline la ANH THAT tu folder (Expected Gradients chuan, in-distribution).
+    real_bank: (M,3,H,W) tat ca anh da preprocess. exclude_idx: bo anh dang giai thich.
+    Neu M-1 < K thi lay co lap lai (replacement).
+    """
+    M = real_bank.shape[0]
+    g = torch.Generator(device="cpu"); g.manual_seed(seed + 71)
+    cand = [i for i in range(M) if i != exclude_idx]
+    if len(cand) >= K:
+        perm = torch.randperm(len(cand), generator=g)[:K]
+        idx = [cand[i] for i in perm]
+    else:
+        idx = [cand[int(torch.randint(len(cand), (1,), generator=g))] for _ in range(K)]
+    return real_bank[idx].to(real_bank.device)             # (K,3,H,W)
+
+
 def collect_baselines_for_image(x, args, device, seed, adaptive_sigma=None):
     """
     Tra ve dict {method: baseline_tensor(3,H,W)} — DUNG cach attribution tao baseline,
@@ -187,7 +207,7 @@ def baseline_strength_row(model, x, baseline, target):
 
 def attributions_for_image(x, grad_fn, args, device, seed,
                            model=None, target=None, rep_fn=None, ref_pool=None, n_class=1000,
-                           adaptive_sigma=None):
+                           adaptive_sigma=None, real_bank=None, eg_real=False, cur_idx=None):
     """
     Chi IG + baseline (theo E1, path thang). Tra ve dict {method: attr(3,H,W)}.
       - Shrinkage-IG@sigma        : baseline = Wiener low-pass FFT (blur), IG thang toi x.
@@ -217,9 +237,12 @@ def attributions_for_image(x, grad_fn, args, device, seed,
         for nm, b in zip(names, fixed):
             out[f"IG-{nm}"] = ig_single(x, b, grad_fn, T=args.N)
 
-    # --- EG (random-sample pool), moi K mot dong ---
+    # --- EG pool: x+noise (mac dinh) HOAC anh that tu folder (--eg_real) ---
     for K in args.eg_K:
-        pool = make_eg_pool(x, K, args.eg_noise, device, seed)
+        if eg_real and real_bank is not None:
+            pool = make_eg_pool_real(K, real_bank, seed, exclude_idx=cur_idx)
+        else:
+            pool = make_eg_pool(x, K, args.eg_noise, device, seed)
         out[f"EG-{K}"] = eg(x, pool, grad_fn, N=args.N)
 
     # --- DOI TRONG: IG2 / Max-Entropy / FRInGe ---
@@ -638,6 +661,15 @@ def main():
                           f"IQR [{_vs[_n//4]:.3f}, {_vs[(3*_n)//4]:.3f}]  (pixel)")
         print()
 
+    # --- bank anh that cho --eg_real (Expected Gradients chuan, in-distribution) ---
+    real_bank = None
+    if args.eg_real:
+        _cap = min(len(paths), max(64, max(args.eg_K) * 4))   # du de sample, khong ton het RAM
+        real_bank = torch.stack([preprocess(Image.open(p), size=224, device=device)
+                                 for p in paths[:_cap]], 0)
+        print(f"[i] --eg_real: EG lay baseline tu {real_bank.shape[0]} anh THAT trong folder "
+              f"(thay vi x+noise).")
+
     for ip, path in enumerate(paths):
         x = preprocess(Image.open(path), size=224, device=device)
         if args.target is None:
@@ -661,7 +693,8 @@ def main():
         attrs = attributions_for_image(x, grad_fn, args, device, args.seed,
                                        model=model, target=target, rep_fn=rep_fn,
                                        ref_pool=ref_pool, n_class=n_class,
-                                       adaptive_sigma=adaptive_sigma)
+                                       adaptive_sigma=adaptive_sigma,
+                                       real_bank=real_bank, eg_real=args.eg_real, cur_idx=ip)
         if metric_names is None:
             metric_names = list(attrs.keys())
             for m in metric_names:
@@ -821,7 +854,10 @@ def main():
             _gff = lambda _t: make_resnet50_gradfn(model, _t, device,
                                                    chunk=args.chunk, score=args.score)
             # EG pool o day = x + N(0, eg_noise): dung DUNG phan phoi baseline EG that.
-            _eg_pool_fn = lambda x: make_eg_pool(x, 16, args.eg_noise, device, args.seed)
+            if args.eg_real and real_bank is not None:
+                _eg_pool_fn = lambda x: make_eg_pool_real(16, real_bank, args.seed)
+            else:
+                _eg_pool_fn = lambda x: make_eg_pool(x, 16, args.eg_noise, device, args.seed)
             # v2 probe do bias TRUC TIEP cho ca hai chinh sach (khong dung cong thuc K*).
             _bp.probe_budget_law(diag_pool, ref=None, grad_fn_factory=_gff,
                                  target_default=None, N=args.N, n_eval=8,

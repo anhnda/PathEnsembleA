@@ -43,6 +43,7 @@ from sklearn.preprocessing import MinMaxScaler
 from synthetic_e0 import (
     fit_reference, shrinkage_baseline, fit_ppca,
     ig_tabular, eg_tabular, MLP, score_target,
+    diffusion_ig_tabular,
     make_tabular_gradfn, fit_imputer, insertion_deletion_tabular,
     soft_faith_tabular, _bootstrap_se,
 )

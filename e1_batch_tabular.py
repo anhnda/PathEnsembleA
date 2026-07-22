@@ -443,6 +443,15 @@ def main():
         except Exception as _e:
             print(f"[!] tau_regime check bo qua: {_e}")
 
+        # --- C_PATH PROBE (E5): do do cong path tren MODEL THAT ---
+        try:
+            tau_diag.c_path_probe(
+                X_eval, baseline_fn=lambda x: shrinkage_baseline(x, ref, tau=1.0),
+                ig_fn=ig_tabular, grad_fn=grad_fn, hi=128, n_eval=16,
+                tag=f"tabular/{args.dataset}")
+        except Exception as _e:
+            print(f"[!] c_path probe bo qua: {_e}")
+
     # =====================================================================
     # tau* CLOSED FORM — bo tau khoi danh sach sieu tham so.
     #   g_k(tau) = tau/(s_k+tau) = sigmoid(log tau - log s_k)

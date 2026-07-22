@@ -585,3 +585,55 @@ def print_fixed_row(name: str, d: dict):
     p2 = f"{d['P2_ok'].mean().item()*100:>6.0f}%" if "P2_ok" in d else f"{'-':>7}"
     print(f"{name:<20}{f(g('f_b'),9)}{f(g('delta_f'),9)}{f(g('dist'),10)}"
           f"{f(g('maha_b'),13)}{p2}")
+
+# =============================================================================
+# C_PATH PROBE — do do cong duong tich phan cho E5 (budget-allocation law).
+# Dung chung cho tabular/nlp/image. Do DOC LAP voi faithfulness.
+#
+# Bias cau phuong midpoint ~ C_path^2 * L^2 / m^2. Proxy TRUC TIEP:
+#   ||IG_2step - IG_highres|| / ||IG_highres||   (chuan hoa: do cong THUAN,
+#   khong lan L — de so C_path GIUA cac modality tren cung thang do).
+# Kem theo L = ||x-b|| tho de tinh bias tuyet doi khi can.
+#
+# E5 claim: C_path(image) >> C_path(tabular, nlp). Ham nay do de KIEM dieu do
+# tren MODEL THAT, khong phai toy. Neu tabular/nlp cung cao => E5 lung lay.
+# =============================================================================
+def c_path_probe(x_batch, baseline_fn, ig_fn, grad_fn, hi=128, n_eval=16,
+                 tag=""):
+    """
+    x_batch    : (M, D) cac input that (embedding/feature).
+    baseline_fn(x) -> baseline (D,) hoac (M,D): baseline shrinkage dai dien.
+    ig_fn(x, x0, grad_fn, T) -> attribution (D,): ig_tabular / ig_single.
+    grad_fn    : ham gradient cua model.
+    Tra ve dict {C_path_mean, C_path_median, L_mean}.
+    """
+    import torch as _t
+    M = x_batch.shape[0]
+    idx = _t.arange(min(n_eval, M))
+    Cs, Ls = [], []
+    for i in idx:
+        x = x_batch[i]
+        b = baseline_fn(x)
+        if b is None:
+            continue
+        if b.dim() > 1:
+            b = b[0] if b.shape[0] == 1 else b
+        L = (x - b).norm().item()
+        ig2 = ig_fn(x, b, grad_fn, 2)
+        ighi = ig_fn(x, b, grad_fn, hi)
+        denom = ighi.norm().clamp_min(1e-8)
+        Cs.append(((ig2 - ighi).norm() / denom).item())
+        Ls.append(L)
+    if not Cs:
+        print(f"[!] c_path_probe [{tag}]: khong co input hop le.")
+        return None
+    Cs_t = _t.tensor(Cs)
+    out = {"C_path_mean": float(Cs_t.mean()),
+           "C_path_median": float(Cs_t.median()),
+           "L_mean": float(sum(Ls) / len(Ls))}
+    print(f"\n=== C_PATH PROBE [{tag}] (n={len(Cs)}) ===")
+    print(f"[i] C_path (do cong path, chuan hoa) = mean {out['C_path_mean']:.4f}  "
+          f"median {out['C_path_median']:.4f}")
+    print(f"[i] L = ||x-b|| mean = {out['L_mean']:.3f}")
+    print(f"[i] E5: ky vong C_path(image)~1.3 >> C_path(tabular/nlp). Neu cao o day => E5 nghi ngo.")
+    return out

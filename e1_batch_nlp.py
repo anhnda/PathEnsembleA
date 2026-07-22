@@ -534,6 +534,7 @@ def main():
         print(f"[i] RIVALS bat: IG2/MaxEnt/FRInGe (ig2_steps={args.ig2_steps}, me_steps={args.me_steps}), "
               f"CF ref seq={ig2_ref_embed.shape[1]}\n")
 
+    _cpath_acc, _L_acc = [], []      # C_PATH PROBE (E5)
     for si, (text, _label) in enumerate(sample):
         enc = tokenizer(text, truncation=True, max_length=args.max_len, return_tensors="pt").to(device)
         input_ids = enc["input_ids"]
@@ -552,6 +553,20 @@ def main():
             for j, tid in enumerate(input_ids[0].tolist()):
                 if tid in special_ids:
                     keep_tok[j] = False
+
+        # --- C_PATH PROBE (E5): do cong path tu shrinkage baseline, 2 vs hi step ---
+        # DOC LAP faithfulness. Ky vong: C_path(nlp) THAP (gan-tuyen tinh) neu E5 dung.
+        try:
+            _be_sh = shrinkage_baseline(word_embed[0], ref, tau=1.0).unsqueeze(0)
+            _a2, _ = ig_embedding(fwd, model, word_embed, _be_sh, position_embed,
+                                  type_embed, attn, pred_class, 2)
+            _ahi, _ = ig_embedding(fwd, model, word_embed, _be_sh, position_embed,
+                                   type_embed, attn, pred_class, 64)
+            _den = _ahi.norm().clamp_min(1e-8)
+            _cpath_acc.append(((_a2 - _ahi).norm() / _den).item())
+            _L_acc.append((word_embed - _be_sh).norm().item())
+        except Exception:
+            pass
 
         for nm in methods:
             if nm == "IG2":
@@ -674,7 +689,16 @@ def main():
         if (si + 1) % 5 == 0 or si + 1 == len(sample):
             print(f"[{si+1}/{len(sample)}] done")
 
-    # ---- bang tong hop (mean±SE). Soft-gap = NC + NS - 1 (kieu I-D gap cua NLP) ----
+    # ---- C_PATH PROBE (E5): do cong path tren DistilBERT that ----
+    if _cpath_acc:
+        import statistics as _st
+        _cm = _st.mean(_cpath_acc); _cmed = _st.median(_cpath_acc); _Lm = _st.mean(_L_acc)
+        print(f"\n=== C_PATH PROBE [nlp/{args.dataset}] (n={len(_cpath_acc)}) ===")
+        print(f"[i] C_path (do cong path, chuan hoa) = mean {_cm:.4f}  median {_cmed:.4f}")
+        print(f"[i] L = ||emb-b|| mean = {_Lm:.3f}")
+        print(f"[i] E5: ky vong C_path(image)~1.3 >> C_path(nlp). Neu cao o day => E5 nghi ngo.")
+
+
     # Soft-NC↑ (xoa quan trong -> sap manh), Soft-NS↑ (giu quan trong -> dung vung).
     # Faithful can CA HAI cao. Gop lai: Soft-gap = NC + NS - 1  (cang cao cang faithful).
     n = len(sample)

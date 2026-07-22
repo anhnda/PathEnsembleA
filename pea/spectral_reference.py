@@ -185,3 +185,22 @@ def spectral_reference(x, mode="fft", sigma=1.0, X_data=None, basis=None, **kw):
     if mode == "graph":
         raise ValueError("graph mode: goi spectral_reference_graph(...) truc tiep")
     raise ValueError(f"mode la: {mode}")
+
+def spectral_reference_fracheat(x, sigma, beta=1.0):
+    """
+    FRACTIONAL-heat reference: low-pass e^{-1/2 sigma^2 |omega|^{2 beta}}.
+      beta = 1   -> Gaussian blur (heat duoi -grad^2), = spectral_reference_fft.
+      beta = 1.45 -> fractional Laplacian order 1.45 (do do tu pho anh alpha~-2.9).
+    Kernel khong-Gaussian (Levy-type) khi beta != 1. Test: anh muon beta = -alpha/2.
+    x: (C,H,W). Tra ve (C,H,W).
+    """
+    C, H, W = x.shape
+    X = torch.fft.rfft2(x, dim=(-2, -1))
+    fy = torch.fft.fftfreq(H, device=x.device).view(H, 1)
+    fx = torch.fft.rfftfreq(W, device=x.device).view(1, -1)
+    w2 = (2 * torch.pi) ** 2 * (fy ** 2 + fx ** 2)            # |omega|^2
+    w2b = w2.clamp_min(0) ** beta                             # |omega|^{2 beta}
+    c = torch.exp(-0.5 * (sigma ** 2) * w2b)
+    Xf = X * c[None]
+    xb = torch.fft.irfft2(Xf, s=(H, W), dim=(-2, -1))
+    return xb

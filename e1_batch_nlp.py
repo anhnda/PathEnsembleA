@@ -47,6 +47,7 @@ import math
 import random
 import torch
 import torch.nn.functional as F
+import numpy as np
 
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from datasets import load_dataset
@@ -106,6 +107,8 @@ def parse_args():
     ap.add_argument("--diag_gamma", action="store_true", help="grid scale-free tau = gamma*s_bar")
     ap.add_argument("--diag_eps", type=float, default=0.01)
     ap.add_argument("--n_soft", type=int, default=10, help="so mau Bernoulli cho soft metric")
+    ap.add_argument("--md_ndraw", type=int, default=8,
+                    help="so lan rut nen ref cho marginal insertion/deletion (giam variance)")
     ap.add_argument("--rivals", action="store_true", help="bat IG2 / Max-Entropy / FRInGe")
     ap.add_argument("--ig2_steps", type=int, default=40)
     ap.add_argument("--me_steps", type=int, default=100)
@@ -215,6 +218,71 @@ def ig_embedding(fwd, model, word_embed, base_embed, position_embed, type_embed,
     attr_full = mean_grad * diff                           # (1,seq,d) — giu dim cho soft metric
     attr_token = attr_full.sum(dim=-1).squeeze(0)          # (seq,) dot-product
     return attr_token, attr_full
+
+
+@torch.no_grad()
+def insdel_marginal_nlp(fwd, model, word_embed, position_embed, type_embed,
+                        attention_mask, attr_token, pred_class, ref_pool,
+                        keep_tok, n_draw=8, seed=0):
+    """
+    Insertion/Deletion tren EMBEDDING voi MARGINAL REMOVAL (khop tabular/image):
+    xoa mot token = thay word-embedding cua no bang MOT embedding THAT rut tu ref_pool
+    (in-distribution), KHONG phai baseline b_tau, KHONG phai zero/mask.
+
+    - deletion : bat dau tu x, thay dan token quan trong nhat -> embedding ref ngau nhien.
+                 f(pred) tut nhanh => attribution tot => del_auc THAP.
+    - insertion: bat dau tu nen (moi token = embedding ref ngau nhien), phuc hoi dan
+                 token quan trong nhat ve embedding THAT. f(pred) len nhanh => ins_auc CAO.
+
+    Trung binh tren n_draw lan rut nen de giam phuong sai (nen la ngau nhien).
+    Chi thao tac tren token THUONG (keep_tok); special token giu nguyen ca hai chieu.
+
+    Tra ve (ins_auc, del_auc, id_gap=ins-del).  ref_pool: (M,d) embedding THAT.
+    """
+    dev = word_embed.device
+    seq = word_embed.shape[1]
+    tok_idx = keep_tok.nonzero().flatten()                  # cac vi tri token thuong
+    n = tok_idx.numel()
+    if n == 0:
+        return float("nan"), float("nan"), float("nan")
+
+    # thu tu quan trong: |attr| giam dan, chi tren token thuong
+    a = attr_token[tok_idx].abs()
+    order = tok_idx[torch.argsort(a, descending=True)]      # vi tri token, quan trong -> khong
+
+    def prob(emb):
+        lg = fwd(model, emb, attention_mask=attention_mask,
+                 position_embed=position_embed, type_embed=type_embed)
+        return torch.softmax(lg, -1)[0, pred_class].item()
+
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    ins_curves, del_curves = [], []
+    M = ref_pool.shape[0]
+    for _ in range(n_draw):
+        # nen marginal: moi token thuong <- 1 embedding ref ngau nhien (in-distribution)
+        ridx = torch.randint(M, (n,), generator=g).to(dev)
+        base = word_embed.clone()
+        base[0, order] = ref_pool[ridx]                     # thay theo thu tu de index nhat quan
+
+        # --- deletion: tu x, xoa dan (thay = ref) theo do quan trong ---
+        cur = word_embed.clone(); dele = [prob(cur)]
+        for r, pos in enumerate(order):
+            cur[0, pos] = ref_pool[ridx[r]]
+            dele.append(prob(cur))
+        # --- insertion: tu nen, phuc hoi dan token THAT theo do quan trong ---
+        cur = base.clone(); ins = [prob(cur)]
+        for r, pos in enumerate(order):
+            cur[0, pos] = word_embed[0, pos]
+            ins.append(prob(cur))
+
+        _trap = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+        ins_curves.append(_trap(ins) / (len(ins) - 1))
+        del_curves.append(_trap(dele) / (len(dele) - 1))
+
+    ins_auc = float(np.mean(ins_curves))
+    del_auc = float(np.mean(del_curves))
+    return ins_auc, del_auc, ins_auc - del_auc
+
 
 
 # ===========================================================================
@@ -426,16 +494,16 @@ def main():
             _summ = f"e1_nlp_{args.model}_{args.dataset}_summary.csv"
             import os as _os
             _res = _tr.check_match(
-                ref_s=ref.s, curve_path=_tc, metric="soft_gap",
+                ref_s=ref.s, curve_path=_tc, metric="md_idgap",
                 summary_path=_summ if _os.path.exists(_summ) else None,
-                summary_metric="soft_gap_mean", zero_name="IG-zero",
+                summary_metric="md_idgap_mean", zero_name="IG-zero",
                 tag=f"nlp/{args.dataset}")
             _tr.print_regime_check(_res)
         except Exception as _e:
             print(f"[!] tau_regime check bo qua: {_e}")
 
     # ---- accumulators ----
-    metric_keys = ["soft_nc", "soft_ns", "soft_logodds"]
+    metric_keys = ["soft_nc", "soft_ns", "soft_logodds", "md_ins", "md_del", "md_idgap"]
     acc = {m: {k: [] for k in metric_keys} for m in methods}
     per_rows = []
     bl_strength = {}          # {method: {"pf":[], "pb":[], "ratio":[], "shift":[]}}  f(x) vs f(baseline)
@@ -587,7 +655,21 @@ def main():
             acc[nm]["soft_nc"].append(nc)
             acc[nm]["soft_ns"].append(ns)
             acc[nm]["soft_logodds"].append(lo)
-            per_rows.append({"idx": si, "method": nm, "soft_nc": nc, "soft_ns": ns, "soft_logodds": lo})
+
+            # --- MARGINAL-REMOVAL insertion/deletion (khop tabular/image) ---
+            # xoa token = thay embedding bang embedding THAT tu X_ref (in-distribution).
+            # KHONG tai dung baseline. Metric nay doc lap voi bt, dau ro rang.
+            m_ins, m_del, m_gap = insdel_marginal_nlp(
+                fwd, model, word_embed, position_embed, type_embed, attn,
+                attr_token, pred_class, ref_pool=X_ref, keep_tok=keep_tok,
+                n_draw=args.md_ndraw, seed=args.seed)
+            acc[nm]["md_ins"].append(m_ins)
+            acc[nm]["md_del"].append(m_del)
+            acc[nm]["md_idgap"].append(m_gap)
+
+            per_rows.append({"idx": si, "method": nm, "soft_nc": nc, "soft_ns": ns,
+                             "soft_logodds": lo, "md_ins": m_ins, "md_del": m_del,
+                             "md_idgap": m_gap})
 
         if (si + 1) % 5 == 0 or si + 1 == len(sample):
             print(f"[{si+1}/{len(sample)}] done")
@@ -698,9 +780,37 @@ def main():
                              "soft_nc_mean": nc_m, "soft_nc_se": nc_se,
                              "soft_ns_mean": ns_m, "soft_ns_se": ns_se,
                              "soft_gap_mean": gp_m, "soft_gap_se": gp_se,
-                             "soft_logodds_mean": lo_m, "soft_logodds_se": lo_se})
+                             "soft_logodds_mean": lo_m, "soft_logodds_se": lo_se,
+                             "md_ins_mean": mean_se(acc[m]["md_ins"])[0],
+                             "md_del_mean": mean_se(acc[m]["md_del"])[0],
+                             "md_idgap_mean": mean_se(acc[m]["md_idgap"])[0],
+                             "md_idgap_se": mean_se(acc[m]["md_idgap"])[1]})
     print("-" * 130)
     print(f"[i] dan dau Soft-gap (=NC+NS-1): {best_m} = {best_gap:.4f}")
+
+    # ---- BANG THU HAI: MARGINAL-REMOVAL insertion/deletion (metric CHINH moi) ----
+    # Doc lap voi baseline, dau ro rang, khop tabular/image. Xep hang theo I-D = ins - del.
+    md_gap = {m: mean_se(acc[m]["md_idgap"])[0] for m in methods}
+    best_md = max(md_gap, key=md_gap.get)
+    print(f"\n{'method':<20}{'MD-ins↑':>12}{'MD-del↓':>12}{'MD I-D↑':>14}")
+    print("-" * 58)
+    for m in methods:
+        i_m = mean_se(acc[m]["md_ins"])[0]
+        d_m = mean_se(acc[m]["md_del"])[0]
+        g_m, g_se = mean_se(acc[m]["md_idgap"])
+        mark = "  <-- best (marginal I-D)" if m == best_md else ""
+        print(f"{m:<20}{i_m:>12.4f}{d_m:>12.4f}{g_m:>8.4f}±{g_se:<5.4f}{mark}")
+    print("-" * 58)
+    print(f"[i] MD I-D = insertion - deletion voi MARGINAL REMOVAL (thay token bang embedding")
+    print(f"[i]   THAT tu reference pool, KHONG tai dung baseline). Metric nay khop tabular/image,")
+    print(f"[i]   dau ro rang (cao=tot), doc lap voi bt. So sanh voi Soft-gap o bang tren.")
+    _zero_md = md_gap.get("IG-zero")
+    if _zero_md is not None and best_md != "IG-zero" and best_md.startswith("Shrinkage"):
+        print(f"[i] DUOI metric moi: {best_md} = {md_gap[best_md]:.4f} > IG-zero = {_zero_md:.4f}")
+        print(f"[i]   => Shrinkage KHONG con thua zero. 'NLP fails' truoc day la ARTIFACT cua soft metric.")
+    elif _zero_md is not None and md_gap.get(best_md, -9) <= _zero_md:
+        print(f"[i] DUOI metric moi: van khong method nao vuot IG-zero ({_zero_md:.4f}).")
+        print(f"[i]   => neu ca marginal I-D cung vay thi 'shrinkage kem o NLP' la THAT, khong phai metric.")
     print("[i] Δf = f(x)-f(b) = do thay doi DAU RA.  |b-x|₂ = do thay doi DAU VAO (L2).")
     print("[i] Δf/|b-x| = DO THAY DOI DAU RA / DO THAY DOI DAU VAO. Mot TI SO.")
     print("[i]   Tinh duoc cho MOI hang. Khong can K, khong can mu, khong phu thuoc grid,")
@@ -719,13 +829,18 @@ def main():
         print(f"[i] xep hang Δf/|b-x| : {' > '.join(rk_r[:5])}")
         print(f"[i] xep hang Soft-gap : {' > '.join(rk_g[:5])}")
 
-    # ---- Paired test: Shrinkage(tot nhat theo Soft-gap) vs baseline ----
+    # ---- Paired test: Shrinkage(tot nhat) vs baseline ----
+    # ref = best Shrinkage theo MARGINAL I-D (metric chinh moi), fallback soft_gap.
     shr = [m for m in methods if m.startswith("Shrinkage-IG")]
-    refm = max(shr, key=lambda m: mean_se(acc[m]["soft_gap"])[0]) if shr else best_m
+    if shr:
+        refm = max(shr, key=lambda m: mean_se(acc[m]["md_idgap"])[0])
+    else:
+        refm = best_m
     print(f"\n=== PAIRED TEST: {refm} vs baseline (n={n} cau, ghep cap per-sentence) ===")
     stat_rows = []
     for metric, key in [("Soft-NC", "soft_nc"), ("Soft-NS", "soft_ns"),
-                        ("Soft-gap", "soft_gap"), ("Soft-logodds", "soft_logodds")]:
+                        ("Soft-gap", "soft_gap"), ("Soft-logodds", "soft_logodds"),
+                        ("MD-I-D", "md_idgap")]:
         print(f"\n-- {metric} (cao hon tot) --")
         print(f"{'vs method':<20}{'mean_diff':>12}{'t':>9}{'p(t)':>11}{'z(W)':>9}{'p(Wilcox)':>12}")
         print("-" * 73)

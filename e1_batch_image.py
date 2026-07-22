@@ -39,7 +39,7 @@ from pea.resnet50_gradfn import (
 )
 from pea.insdel import insertion_deletion
 from pea.methods import ig_single, eg
-from pea.spectral_reference import spectral_reference_fft
+from pea.spectral_reference import spectral_reference_fft, spectral_reference_fracheat
 from pea.baselines_rival import (
     resnet50_penultimate, ig2_attribution, sample_counterfactual_ref,
     max_entropy_baseline, ig_from_baseline, fringe_attribution,
@@ -74,6 +74,10 @@ def parse_args():
     ap.add_argument("--eg_real", action="store_true",
                     help="EG lay baseline la ANH THAT tu folder (Expected Gradients chuan, "
                          "in-distribution) thay vi x+noise. Dung de test manifold-vs-noise.")
+    ap.add_argument("--frac_beta", type=float, default=None,
+                    help="Neu dat, them baseline IG-fracheat(beta): low-pass e^{-1/2 sig^2 |w|^{2 beta}}. "
+                         "beta=1=Gaussian blur; beta do tu precision_laplacian_probe (=-alpha/2). "
+                         "Test: fractional-heat co thang Gaussian blur o anh khong.")
     ap.add_argument("--no_fixed", action="store_true", help="bo cac baseline co dinh (chi Shrinkage + EG)")
     # --- doi trong: IG2 / Max-Entropy / FRInGe ---
     ap.add_argument("--rivals", action="store_true",
@@ -165,6 +169,8 @@ def collect_baselines_for_image(x, args, device, seed, adaptive_sigma=None):
     out = {}
     for sig in args.sigma_sweep:
         out[f"Shrinkage-IG@{sig:g}"] = spectral_reference_fft(x, sigma=sig)
+        if args.frac_beta is not None:
+            out[f"IG-fracheat@{sig:g}"] = spectral_reference_fracheat(x, sigma=sig, beta=args.frac_beta)
     if adaptive_sigma:
         for rule, sg in adaptive_sigma.items():
             out[f"Shrinkage-Adaptive-{rule}"] = spectral_reference_fft(x, sigma=float(sg))
@@ -224,6 +230,10 @@ def attributions_for_image(x, grad_fn, args, device, seed,
     for sig in args.sigma_sweep:
         ref = spectral_reference_fft(x, sigma=sig)         # (3,H,W) Wiener low-pass
         out[f"Shrinkage-IG@{sig:g}"] = ig_single(x, ref, grad_fn, T=args.N)
+        # --- fractional-heat baseline (order beta do tu pho anh) ---
+        if args.frac_beta is not None:
+            reff = spectral_reference_fracheat(x, sigma=sig, beta=args.frac_beta)
+            out[f"IG-fracheat@{sig:g}"] = ig_single(x, reff, grad_fn, T=args.N)
 
     # --- Shrinkage-Adaptive: sigma PER-IMAGE do rule chon (sigma_rate / sigma*) ---
     if adaptive_sigma:

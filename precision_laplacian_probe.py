@@ -28,14 +28,26 @@ import numpy as np
 import torch
 
 
-def load_gray(paths, size=224, device="cpu"):
-    """Doc anh -> grayscale (M,H,W), [0,1]. Dung luminance de xet pho khong gian."""
+def load_gray(paths, size=224, device="cpu", native=False):
+    """
+    Doc anh -> grayscale (M,H,W), [0,1].
+    native=False: Resize(256)+CenterCrop(size) — GIONG pipeline IG that (co resample).
+    native=True : CHI center-crop size x size tu anh goc, KHONG resize => khong lam
+                  steepen pho. Dung de tach 'anh that steep' vs 'resize lam steep'.
+    """
     from PIL import Image
     import torchvision.transforms as T
-    tf = T.Compose([T.Resize(256), T.CenterCrop(size), T.Grayscale(), T.ToTensor()])
+    if native:
+        tf = T.Compose([T.Grayscale(), T.CenterCrop(size), T.ToTensor()])
+    else:
+        tf = T.Compose([T.Resize(256), T.CenterCrop(size), T.Grayscale(), T.ToTensor()])
     xs = []
     for p in paths:
-        xs.append(tf(Image.open(p).convert("RGB"))[0])   # (H,W)
+        img = Image.open(p).convert("RGB")
+        # native: neu anh nho hon crop, bo qua
+        if native and (img.size[0] < size or img.size[1] < size):
+            continue
+        xs.append(tf(img)[0])
     return torch.stack(xs).to(device)                    # (M,H,W)
 
 
@@ -109,14 +121,16 @@ def main():
     ap.add_argument("--glob", default="*.JPEG")
     ap.add_argument("--limit", type=int, default=50)
     ap.add_argument("--size", type=int, default=224)
+    ap.add_argument("--native", action="store_true",
+                    help="do pho KHONG resize (chi crop) de tach steep-that vs resize-artifact")
     args = ap.parse_args()
 
     paths = sorted(glob.glob(os.path.join(args.folder, args.glob)))[:args.limit]
     if not paths:
         raise FileNotFoundError(f"khong thay anh: {os.path.join(args.folder, args.glob)}")
-    print(f"[i] {len(paths)} anh, size={args.size}")
+    print(f"[i] {len(paths)} anh, size={args.size}, native={args.native}")
 
-    imgs = load_gray(paths, size=args.size)
+    imgs = load_gray(paths, size=args.size, native=args.native)
     k, S = radial_power_spectrum(imgs)
     alpha, r2, nfit = fit_loglog_slope(k, S)
     cos = precision_vs_laplacian(imgs)
@@ -153,6 +167,11 @@ def main():
         for kk, ss in zip(k, S):
             w.writerow([kk, ss, 1.0/max(ss,1e-30), kk**2])
     print(f"\n[i] curve -> {out}  (k, S(k), 1/S(k), k^2) de plot log-log")
+    frac_order = -alpha / 2.0
+    print(f"\n[i] ==> FRACTIONAL ORDER cho baseline test: beta = -alpha/2 = {frac_order:.3f}")
+    print(f"[i]     Gaussian blur = order 1 (heat duoi -grad^2). Anh nay muon order {frac_order:.2f}.")
+    print(f"[i]     Chay: python e1_batch_image.py <folder> --frac_beta {frac_order:.3f} ...")
+    print(f"[i]     de so IG-fracheat({frac_order:.2f}) vs IG-blur(order 1) vs Shrinkage(Wiener).")
 
 
 if __name__ == "__main__":

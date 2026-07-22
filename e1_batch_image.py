@@ -809,6 +809,23 @@ def main():
         except Exception as _e:
             print(f"[!] tau_regime check bo qua: {_e}")
 
+        # --- BUDGET-LAW PROBE: do C_path (ky vong CAO cho image) + Sigma_base ---
+        # winner that o image = shrinkage/blur; kiem xem K* co du doan 'shrinkage' khong.
+        try:
+            import budget_probe_image as _bp
+            # shrink_fn cho image = blur reference (Fourier low-pass) tai sigma dai dien.
+            _sig_rep = float(sorted(args.sigma_sweep)[len(args.sigma_sweep)//2]) \
+                       if getattr(args, "sigma_sweep", None) else 4.0
+            _shrink_fn = lambda x, _ref, _t: spectral_reference_fft(x, sigma=_sig_rep)
+            # grad_fn PHAI khop target moi anh (grad_fn cuoi vong lap chi ung voi anh cuoi).
+            _gff = lambda _t: make_resnet50_gradfn(model, _t, device,
+                                                   chunk=args.chunk, score=args.score)
+            _bp.probe_budget_law(diag_pool, ref=None, grad_fn_factory=_gff,
+                                 target_default=None, N=args.N, n_eval=8,
+                                 shrink_fn=_shrink_fn, tag="image")
+        except Exception as _e:
+            print(f"[!] budget-law probe bo qua: {_e}")
+
         # baseline CO DINH len CUNG TRUC (black/white/noise/mean/blur)
         _td.print_fixed_header()
         for nm, bfn in [("IG-black", lambda x: make_fixed_baselines(x, device, args.seed)[1][0]),

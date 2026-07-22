@@ -820,9 +820,13 @@ def main():
             # grad_fn PHAI khop target moi anh (grad_fn cuoi vong lap chi ung voi anh cuoi).
             _gff = lambda _t: make_resnet50_gradfn(model, _t, device,
                                                    chunk=args.chunk, score=args.score)
+            # EG pool o day = x + N(0, eg_noise): dung DUNG phan phoi baseline EG that.
+            _eg_pool_fn = lambda x: make_eg_pool(x, 16, args.eg_noise, device, args.seed)
+            # v2 probe do bias TRUC TIEP cho ca hai chinh sach (khong dung cong thuc K*).
             _bp.probe_budget_law(diag_pool, ref=None, grad_fn_factory=_gff,
                                  target_default=None, N=args.N, n_eval=8,
-                                 shrink_fn=_shrink_fn, tag="image")
+                                 shrink_fn=_shrink_fn, pool_baselines=None,
+                                 tag="image", eg_pool_fn=_eg_pool_fn)
         except Exception as _e:
             print(f"[!] budget-law probe bo qua: {_e}")
 

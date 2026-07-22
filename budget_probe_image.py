@@ -20,14 +20,19 @@ def _noop():  # placeholder to keep import side-effect free
 
 def c_path_image(x, b, grad_fn, hi=128):
     """
-    Path curvature proxy = ||IG_2 - IG_hi|| / ||IG_hi||.
-    Bias luong tu hoa midpoint ~ C_path / m^2, nen hieu 2-step vs hi-step la
-    proxy TRUC TIEP cho do cong C_path doc doan b->x. Khong dung faithfulness.
+    Bias luong tu hoa TUYET DOI (giu phu thuoc do dai path L=||x-b||):
+    ||IG_2 - IG_hi||  — KHONG chuan hoa theo ||IG_hi|| (chuan hoa se BO MAT phu
+    thuoc L, ma L moi la bien phan biet image vs tabular). Tra ve (bias_abs, L).
+
+    Ly do (sua tu ban truoc, da bi falsify): remainder cau phuong ~ C^2 * L^2 / m^2.
+    EG thua o image vi baseline la anh ngau nhien XA (L lon 400-1000) => path dai,
+    coarse => bias no. Shrinkage thang vi L nho (~150) + du step. Phai giu L.
     """
+    L = (x - b).norm().item()
     ig2 = ig_single(x, b, grad_fn, T=2)
     ighi = ig_single(x, b, grad_fn, T=hi)
-    denom = ighi.norm().clamp_min(1e-8)
-    return ((ig2 - ighi).norm() / denom).item()
+    bias_abs = (ig2 - ighi).norm().item()
+    return bias_abs, L
 
 
 def sigma_base_image(x, pool, grad_fn, K_probe=16, hi=32):
@@ -47,36 +52,65 @@ def sigma_base_image(x, pool, grad_fn, K_probe=16, hi=32):
 
 
 def probe_budget_law(diag_pool, ref, grad_fn_factory, target_default=None,
-                     N=64, n_eval=8, shrink_fn=None, tag="image"):
+                     N=64, n_eval=8, shrink_fn=None, pool_baselines=None,
+                     eg_pool_fn=None, tag="image"):
     """
-    diag_pool     : list[(x, target)] anh da giu lai.
-    ref           : GaussRef (co shrinkage). shrink_fn(x, ref, tau) -> baseline.
-    grad_fn_factory(target) -> grad_fn  (vi grad_fn gan voi target cu the).
-    Neu grad_fn dung chung 1 target, truyen grad_fn_factory = lambda t: grad_fn.
+    So sanh TRUC TIEP hai chinh sach ngan sach bang BIAS DO DUOC (khong dung cong
+    thuc K* da bi falsify). Voi cung N:
+      - shrinkage: 1 baseline GAN (L nho), N step  -> bias thap.
+      - EG-K     : K baseline XA (anh ngau nhien, L lon), N/K step -> bias cao.
 
-    In C_path, Sigma_base, K* va DU DOAN winner (EG neu K*>4, else shrinkage).
-    KHONG tinh insertion/deletion o day — winner that lay tu bang chinh cua script.
+    Do bias = ||IG_coarse - IG_hi|| cho moi chinh sach, roi bao chinh sach nao bias
+    thap hon => du doan chinh sach do thang. Doi chieu voi winner THAT (bang I-D).
     """
     import numpy as np
-    Cs, Sbs = [], []
-    pool = torch.stack([p for p, _ in diag_pool])   # (M,3,H,W)
+    pool = pool_baselines if pool_baselines is not None else \
+           torch.stack([p for p, _ in diag_pool])
+    L_sh, L_eg = [], []
+    bias_sh, bias_eg = [], []
+    Sbs = []
     for x, tgt in diag_pool[:n_eval]:
         t = tgt if target_default is None else target_default
         grad_fn = grad_fn_factory(t)
-        b_sh = shrink_fn(x, ref, 1.0)               # representative shrinkage baseline
-        Cs.append(c_path_image(x, b_sh, grad_fn))
-        Sbs.append(sigma_base_image(x, pool, grad_fn))
-    C = float(np.mean(Cs)); Sig = float(np.mean(Sbs))
-    Kstar = (Sig * N**4 / max(C, 1e-8)**2) ** 0.2
-    pred = "EG" if Kstar > 4 else "shrinkage"
-    print(f"\n=== BUDGET-LAW PROBE [{tag}] (n={min(n_eval,len(diag_pool))}, N={N}) ===")
-    print(f"[i] C_path (path curvature)   = {C:.4f}   <- KY VONG CAO cho image")
-    print(f"[i] Sigma_base (attr spread)  = {Sig:.4f}")
-    print(f"[i] K* ∝ (Sigma_base N^4 / C_path^2)^(1/5) = {Kstar:.2f}")
-    print(f"[i] DU DOAN: {'DIVERSITY (EG)' if pred=='EG' else 'RESOLUTION (shrinkage)'}")
-    print(f"[i]   So voi TABULAR (C_path~0.01, K*~370 => EG). Neu image C_path >> 0.01")
-    print(f"[i]   va K* nho => luat GIAI THICH duoc vi sao shrinkage thang o image.")
-    print(f"[i] DOI CHIEU: winner THAT o image (tu bang I-D chinh) la shrinkage/blur.")
-    print(f"[i]   Neu pred == shrinkage => K* du doan DUNG => luat SONG.")
-    print(f"[i]   Neu pred == EG nhung that ra shrinkage thang => luat SAI o image. [FALSIFIED]")
-    return dict(C_path=C, Sigma_base=Sig, Kstar=Kstar, pred=pred)
+
+        # --- shrinkage policy: gan, full N step ---
+        b_sh = shrink_fn(x, ref, 1.0)
+        L_sh.append((x - b_sh).norm().item())
+        # bias cua path shrinkage o do phan giai N: ||IG_N - IG_hi||
+        ig_full = ig_single(x, b_sh, grad_fn, T=min(N, 128))
+        ig_hi   = ig_single(x, b_sh, grad_fn, T=256)
+        bias_sh.append((ig_full - ig_hi).norm().item())
+
+        # --- EG policy: K=16 baseline (x + noise), N/16 step moi cai ---
+        K = 16; m = max(2, N // K)
+        if eg_pool_fn is not None:
+            egp = eg_pool_fn(x)                     # (K,3,H,W) = x + N(0,noise)
+        else:
+            egp = pool[torch.randperm(len(pool))[:K]]
+        per_bias = []
+        Ls = []
+        for j in range(egp.shape[0]):
+            b = egp[j]
+            Ls.append((x - b).norm().item())
+            igc = ig_single(x, b, grad_fn, T=m)
+            igh = ig_single(x, b, grad_fn, T=128)
+            per_bias.append((igc - igh).norm().item())
+        L_eg.append(float(np.mean(Ls)))
+        bias_eg.append(float(np.mean(per_bias)))
+
+    L_sh_m, L_eg_m = float(np.mean(L_sh)), float(np.mean(L_eg))
+    b_sh_m, b_eg_m = float(np.mean(bias_sh)), float(np.mean(bias_eg))
+    pred = "shrinkage" if b_sh_m < b_eg_m else "EG"
+
+    print(f"\n=== BUDGET-LAW PROBE v2 [{tag}] (n={min(n_eval,len(diag_pool))}, N={N}) ===")
+    print(f"[i] SHRINKAGE policy: L=||b-x||={L_sh_m:8.1f}  (gan)   bias@Nstep = {b_sh_m:.4f}")
+    print(f"[i] EG-16    policy: L=||b-x||={L_eg_m:8.1f}  (xa)    bias@(N/16)= {b_eg_m:.4f}")
+    print(f"[i] Bias ~ C^2 * L^2 / m^2. EG co L LON + m NHO (N/16) => bias no.")
+    print(f"[i] DU DOAN (bias thap hon thang): {pred.upper()}")
+    print(f"[i] DOI CHIEU winner THAT o image = shrinkage/blur (bang I-D: shr@4=5.01 vs EG-16=3.41).")
+    if pred == "shrinkage":
+        print(f"[OK] v2 du doan DUNG: bias-do-duoc chon shrinkage, khop winner that.")
+        print(f"[OK]  => bien phan biet la L (do dai path) x m (step), KHONG phai Sigma_base.")
+    else:
+        print(f"[!!] v2 VAN SAI: bias-do-duoc chon EG nhung shrinkage thang. Con thieu so hang khac.")
+    return dict(L_shrink=L_sh_m, L_eg=L_eg_m, bias_shrink=b_sh_m, bias_eg=b_eg_m, pred=pred)

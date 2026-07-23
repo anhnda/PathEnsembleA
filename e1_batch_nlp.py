@@ -813,6 +813,11 @@ def main():
                     fwd, model, word_embed, ref, position_embed, type_embed,
                     attn, pred_class, taus=_diffusion_taus_nlp)
             else:
+                # --- IG THANG tu baseline cua method (zero/pad/mask/mean/random,
+                #     Shrinkage-IG@tau, PM-IG-PPCA). be = (1,seq,d). ---
+                be = baseline_embed_for(nm, word_embed)
+                _, attr_full = ig_embedding(fwd, model, word_embed, be, position_embed,
+                                            type_embed, attn, pred_class, args.steps)
 
                 # --- DEBUG: baseline strength f(x) vs f(baseline) (softmax pred_class) ---
                 with torch.no_grad():

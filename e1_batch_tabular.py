@@ -45,6 +45,7 @@ from synthetic_e0 import (
     ig_tabular, eg_tabular, MLP, score_target,
     diffusion_ig_tabular,
     make_tabular_gradfn, fit_imputer, insertion_deletion_tabular,
+    insertion_deletion_tabular_expected, make_reference_set_tabular,
     soft_faith_tabular, _bootstrap_se,
 )
 from pea.baselines_rival import (
@@ -90,6 +91,13 @@ def parse_args():
                     help="so seed cho baseline ngau nhien (IG-random/EG) — bao cao mean±std de kh khoi may rui")
     ap.add_argument("--n_soft", type=int, default=20, help="so mau Bernoulli cho soft metric")
     ap.add_argument("--insdel_steps", type=int, default=None, help="so buoc ins/del (mac dinh D)")
+    ap.add_argument("--fixed_ref", action="store_true",
+                    help="metric CU: 1 gia tri thay the co dinh. Mac dinh la KY VONG tren "
+                         "reference set {zero, mean, mean+noise} — khong thien vi baseline nao.")
+    ap.add_argument("--n_refs", type=int, default=None,
+                    help="cat bot reference set (mac dinh dung het: zero, mean, mean+noise x2)")
+    ap.add_argument("--ref_noise", type=float, nargs="+", default=[0.5, 1.0],
+                    help="cac muc sd cho reference mean+noise (nhan voi std tung cot, CO DINH theo seed)")
     ap.add_argument("--score", type=str, default="softmax", choices=["logit", "softmax"])
     # --- TAU-DIAGNOSTIC (dense sweep, per-input, KHONG dung ins/del de chon) ---
     ap.add_argument("--tau_star", action="store_true",
@@ -317,7 +325,30 @@ def main():
                 return (x + delta).detach()               # GradCF
         return None            # IG-random, EG-*: pool nhieu diem -> bo qua debug
 
+    # --- REFERENCE SET (tabular): zero / mean / mean+noise, CO DINH theo seed ---
+    _ref_names_tab, _ = make_reference_set_tabular(
+        X_eval[0], X_pool=Xtr, noise_stds=tuple(args.ref_noise), seed=args.seed)
+    if args.n_refs is not None:
+        _ref_names_tab = _ref_names_tab[:args.n_refs]
+    print(f"[i] METRIC = ky vong I-D tren {len(_ref_names_tab)} reference: {_ref_names_tab}"
+          + ("   [--fixed_ref: DANG dung metric cu]" if args.fixed_ref else ""))
+
     @torch.no_grad()
+    def insdel_eval(x, phi, gen):
+        """Cham 1 mau. Mac dinh = ky vong tren reference set; --fixed_ref quay ve metric cu."""
+        if args.fixed_ref:
+            return insertion_deletion_tabular(model, x, phi, imputer, steps=args.insdel_steps,
+                                              target=target, score=args.score,
+                                              mode=args.insdel_mode, X_pool=Xtr, gen=gen)
+        nms, rfs = make_reference_set_tabular(x, X_pool=Xtr,
+                                              noise_stds=tuple(args.ref_noise), seed=args.seed)
+        if args.n_refs is not None:
+            nms, rfs = nms[:args.n_refs], rfs[:args.n_refs]
+        return insertion_deletion_tabular_expected(
+            model, x, phi, imputer, steps=args.insdel_steps, target=target,
+            score=args.score, mode=args.insdel_mode, refs=rfs, ref_names=nms,
+            X_pool=Xtr, gen=gen)
+
     def baseline_strength(name):
         """
         Per-input, KHONG trung binh som. Tra ve dict cac tensor (M,):
@@ -415,9 +446,7 @@ def main():
                     og = torch.Generator(device="cpu"); og.manual_seed(args.seed + 7 + i)
                     b = shrinkage_baseline(x, ref, tau=t)
                     phi = ig_tabular(x, b, grad_fn, T=N)
-                    r = insertion_deletion_tabular(model, x, phi, imputer, steps=args.insdel_steps,
-                                                   target=target, score=args.score,
-                                                   mode=args.insdel_mode, X_pool=Xtr, gen=og)
+                    r = insdel_eval(x, phi, og)
                     id_per_tau[i, t_i] = r["id_gap"]
             oracle = tau_diag.oracle_tau(curve, id_per_tau)
             print(f"[i] ORACLE I-D theo tau (aggregate): "
@@ -576,15 +605,15 @@ def main():
             ins_all, del_all = [], []
             for sd in seeds:
                 rs = (args.seed + 1000 + sd) if sd is not None else None
-                ins, dels, gaps = [], [], []
+                ins, dels, gaps, ref_stds = [], [], [], []
                 for i in range(X_eval.shape[0]):
                     x = X_eval[i]
                     idg = torch.Generator(device="cpu"); idg.manual_seed(args.seed + 7 + i)
                     phi = attr_for(nm, x, rng_seed=rs, i=i)
-                    r = insertion_deletion_tabular(model, x, phi, imputer, steps=args.insdel_steps,
-                                                   target=target, score=args.score, mode=args.insdel_mode,
-                                                   X_pool=Xtr, gen=idg)
+                    r = insdel_eval(x, phi, idg)
                     ins.append(r["insertion_auc"]); dels.append(r["deletion_auc"]); gaps.append(r["id_gap"])
+                    if "id_gap_std" in r:
+                        ref_stds.append(r["id_gap_std"])
                 gaps_t = torch.tensor(gaps)
                 per_sample_gap = gaps_t if per_sample_gap is None else per_sample_gap + gaps_t
                 seed_id_means.append(gaps_t.mean().item())
@@ -596,7 +625,11 @@ def main():
             table[nm] = {"insertion": sum(ins_all) / len(ins_all),
                          "deletion": sum(del_all) / len(del_all),
                          "id_gap": per_sample_gap.mean().item(), "id_se": se,
-                         "seed_std": seed_std, "n_seeds": len(seeds)}
+                         "seed_std": seed_std, "n_seeds": len(seeds),
+                         # ref_std = do lech I-D GIUA cac reference (trung binh qua mau).
+                         # Lon => thu hang phu thuoc reference, do la ket qua can bao cao.
+                         "ref_std": (sum(ref_stds) / len(ref_stds)) if ref_stds else 0.0,
+                         "n_refs": len(_ref_names_tab)}
             tail = f"   ± {se:.4f}" + (f"  [seed-std {seed_std:.4f}, n={len(seeds)}]" if len(seeds) > 1 else "")
             scol = _fmt_strength(bl_str.get(nm))
             print(f"{nm:<20}{table[nm]['insertion']:>12.4f}{table[nm]['deletion']:>12.4f}"

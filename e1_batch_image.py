@@ -37,7 +37,8 @@ from pea.resnet50_gradfn import (
     load_resnet50, make_resnet50_gradfn, preprocess,
     IMAGENET_MEAN, IMAGENET_STD,
 )
-from pea.insdel import insertion_deletion
+from pea.insdel import (insertion_deletion_expected, insertion_deletion_fixed,
+                        make_reference_set)
 from pea.methods import ig_single, eg
 from pea.spectral_reference import (spectral_reference_fft, spectral_reference_fracheat,
                                     measure_beta, direct_baseline_image)
@@ -96,7 +97,15 @@ def parse_args():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--insdel_steps", type=int, default=224)
     ap.add_argument("--substrate", type=str, default="blur", choices=["blur", "black"],
-                    help="nen cho insertion / gia tri xoa deletion (doc lap voi baseline)")
+                    help="[DEPRECATED] chi dung khi --fixed_substrate. Measure chinh la ky vong "
+                         "tren nhieu reference (--n_refs), khong phai 1 substrate co dinh.")
+    ap.add_argument("--fixed_substrate", action="store_true",
+                    help="quay ve metric CU: 1 substrate co dinh (--substrate). Chi de doi chieu — "
+                         "thien vi method co path trung voi substrate (blur/diffusion).")
+    ap.add_argument("--n_refs", type=int, default=8,
+                    help="so reference trong ky vong I-D (zero/noise/blur nhieu sigma/mean/anh that)")
+    ap.add_argument("--ref_real", action="store_true",
+                    help="them ANH THAT tu folder vao reference set (expectation-over-data)")
     ap.add_argument("--score", type=str, default="logit", choices=["logit", "softmax"],
                     help="dung CHUNG cho attribution backward va metric")
     ap.add_argument("--limit", type=int, default=None, help="chi chay N anh dau (debug)")
@@ -543,7 +552,15 @@ def main():
         paths = paths[:args.limit]
     if not paths:
         raise FileNotFoundError(f"khong thay anh: {os.path.join(args.folder, args.glob)}")
-    print(f"[i] {len(paths)} anh, N={args.N}, substrate={args.substrate}, device={device}")
+    if args.fixed_substrate:
+        print(f"[i] {len(paths)} anh, N={args.N}, device={device}")
+        print(f"[i] METRIC = I-D voi 1 SUBSTRATE CO DINH '{args.substrate}' (--fixed_substrate). "
+              f"CANH BAO: thien vi method co path trung substrate (blur/diffusion).")
+    else:
+        print(f"[i] {len(paths)} anh, N={args.N}, device={device}")
+        print(f"[i] METRIC = KY VONG I-D tren {args.n_refs} reference "
+              f"(zero / noise / blur nhieu sigma / mean"
+              + (" / anh THAT" if args.ref_real else "") + "), method-agnostic.")
     print(f"[i] Shrinkage-IG sigma_sweep={args.sigma_sweep}  EG_K={args.eg_K}\n")
 
     model = load_resnet50(device)
@@ -685,7 +702,7 @@ def main():
 
     # --- bank anh that cho --eg_real (Expected Gradients chuan, in-distribution) ---
     real_bank = None
-    if args.eg_real:
+    if args.eg_real or args.ref_real:
         _cap = min(len(paths), max(64, max(args.eg_K) * 4))   # du de sample, khong ton het RAM
         real_bank = torch.stack([preprocess(Image.open(p), size=224, device=device)
                                  for p in paths[:_cap]], 0)
@@ -734,20 +751,40 @@ def main():
             for m in metric_names:
                 acc[m] = {"ins": [], "del": [], "id": []}
 
+        # --- REFERENCE SET dung CHUNG cho moi method tren anh nay (fair comparison) ---
+        _rbank = real_bank if (getattr(args, "ref_real", False) and real_bank is not None) else None
+        ref_names, refs = make_reference_set(x, n_refs=args.n_refs, seed=args.seed + ip,
+                                             real_bank=_rbank)
+
+        def _score_attr(a):
+            if getattr(args, "fixed_substrate", False):
+                return insertion_deletion_fixed(model, x, a, target, device=device,
+                                                steps=args.insdel_steps, substrate=args.substrate,
+                                                batch=args.chunk, score=args.score)
+            return insertion_deletion_expected(model, x, a, target, device=device,
+                                               steps=args.insdel_steps, batch=args.chunk,
+                                               score=args.score, refs=refs, ref_names=ref_names)
+
         img_ids = {}
         for m, a in attrs.items():
-            r = insertion_deletion(model, x, a, target, device=device,
-                                   steps=args.insdel_steps, substrate=args.substrate,
-                                   batch=args.chunk, score=args.score)
+            r = _score_attr(a)
             acc[m]["ins"].append(r["insertion_auc"])
             acc[m]["del"].append(r["deletion_auc"])
             acc[m]["id"].append(r["id_gap"])
             img_ids[m] = r["id_gap"]
-            per_image_rows.append({
+            _row = {
                 "image": os.path.basename(path), "target": target, "method": m,
                 "insertion": r["insertion_auc"], "deletion": r["deletion_auc"],
                 "id_gap": r["id_gap"],
-            })
+            }
+            if "id_gap_std" in r:
+                _row.update({"insertion_std": r["insertion_std"],
+                             "deletion_std": r["deletion_std"],
+                             "id_gap_std": r["id_gap_std"], "n_refs": r["n_refs"]})
+                # I-D theo TUNG reference -> kiem tra thu hang co lat khong
+                for _rn, _rv in r["per_ref"].items():
+                    _row[f"id_gap[{_rn}]"] = _rv["id_gap"]
+            per_image_rows.append(_row)
         # --- Shrinkage-Adaptive-oracle: TRAN TREN. Moi anh chon sigma cho I-D
         #     THAT cao nhat tren grid. KHONG phai rule (nhin ket qua metric de chon)
         #     => chi de DO headroom, khong phai method trien khai duoc. Dat vi phai
@@ -758,9 +795,7 @@ def main():
             for _sg in o_grid:
                 _ref = spectral_reference_fft(x, sigma=float(_sg))
                 _a = ig_single(x, _ref, grad_fn, T=args.N)
-                _r = insertion_deletion(model, x, _a, target, device=device,
-                                        steps=args.insdel_steps, substrate=args.substrate,
-                                        batch=args.chunk, score=args.score)
+                _r = _score_attr(_a)
                 if _r["id_gap"] > o_best_id:
                     o_best_id = _r["id_gap"]; o_best_ins = _r["insertion_auc"]
                     o_best_del = _r["deletion_auc"]; o_best_sig = float(_sg)

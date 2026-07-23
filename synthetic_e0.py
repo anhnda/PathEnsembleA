@@ -493,6 +493,71 @@ def insertion_deletion_tabular(model, x, phi, imputer: GaussImputer,
             "id_gap": (ins[1:].mean() - dele[1:].mean()).item()}
 
 
+# ---------------------------------------------------------------------------
+# TABULAR: reference set + ky vong I-D (thay cho 1 baseline_vec co dinh).
+# Reference: zero / mean / mean+noise (co dinh theo seed).
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def make_reference_set_tabular(x, X_pool=None, mu=None, n_refs=None,
+                               noise_stds=(0.5, 1.0), seed=0):
+    """
+    Tra ve (names, refs) — refs: list vector (D,) cung device/dtype voi x.
+      zero        : goc (0)
+      mean        : trung binh cot cua X_pool (hoac mu truyen vao)
+      mean+noise  : mean + N(0, sd^2 * std_cot^2), CO DINH theo seed (tai lap duoc)
+    """
+    D = x.shape[0]
+    dev, dt = x.device, x.dtype
+    if mu is None:
+        mu = X_pool.mean(0) if X_pool is not None else torch.zeros(D, device=dev, dtype=dt)
+    mu = mu.to(device=dev, dtype=dt)
+    sd_col = (X_pool.std(0) if X_pool is not None else torch.ones(D, device=dev, dtype=dt))
+    sd_col = sd_col.to(device=dev, dtype=dt).clamp_min(1e-8)
+
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    names = ["zero", "mean"]
+    refs = [torch.zeros(D, device=dev, dtype=dt), mu.clone()]
+    for sd in noise_stds:
+        eps = torch.randn(D, generator=g).to(device=dev, dtype=dt) * sd * sd_col
+        names.append(f"mean+noise{sd}"); refs.append(mu + eps)
+    if n_refs is not None:
+        names, refs = names[:n_refs], refs[:n_refs]
+    return names, refs
+
+
+@torch.no_grad()
+def insertion_deletion_tabular_expected(model, x, phi, imputer, steps=None, target=1,
+                                        score="softmax", mode="zero",
+                                        refs=None, ref_names=None, X_pool=None,
+                                        mu=None, seed=0, gen=None, return_per_ref=True):
+    """
+    MEASURE CHINH (tabular): trung binh I-D tren PHAN PHOI reference, khong phai
+    mot baseline_vec co dinh. Voi mode='zero' thi reference chinh la gia tri thay the
+    (zero / mean / mean+noise). Voi mode='marginal'/'conditional' thi cach xoa da la
+    phan phoi san — van lap qua refs de dong nhat giao dien va do variance.
+    """
+    if refs is None:
+        ref_names, refs = make_reference_set_tabular(x, X_pool=X_pool, mu=mu, seed=seed)
+    if ref_names is None:
+        ref_names = [f"ref{i}" for i in range(len(refs))]
+
+    ins_l, del_l, per_ref = [], [], {}
+    for nm, b in zip(ref_names, refs):
+        r = insertion_deletion_tabular(model, x, phi, imputer, steps=steps, target=target,
+                                       score=score, mode=mode, baseline_vec=b,
+                                       X_pool=X_pool, gen=gen)
+        ins_l.append(r["insertion_auc"]); del_l.append(r["deletion_auc"])
+        if return_per_ref:
+            per_ref[nm] = dict(r)
+
+    ins = torch.tensor(ins_l); dele = torch.tensor(del_l); gap = ins - dele
+    _std = (lambda t: t.std(unbiased=True).item() if t.numel() > 1 else 0.0)
+    return {"insertion_auc": ins.mean().item(), "insertion_std": _std(ins),
+            "deletion_auc": dele.mean().item(), "deletion_std": _std(dele),
+            "id_gap": gap.mean().item(), "id_gap_std": _std(gap),
+            "n_refs": len(refs), "ref_names": list(ref_names), "per_ref": per_ref}
+
+
 @torch.no_grad()
 def soft_faith_tabular(model, x, phi, mu, target=1, score="softmax", n_samples=20):
     """

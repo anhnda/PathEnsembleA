@@ -108,7 +108,15 @@ def parse_args():
     ap.add_argument("--diag_eps", type=float, default=0.01)
     ap.add_argument("--n_soft", type=int, default=10, help="so mau Bernoulli cho soft metric")
     ap.add_argument("--md_ndraw", type=int, default=8,
-                    help="so lan rut nen ref cho marginal insertion/deletion (giam variance)")
+                    help="so lan rut nen ref cho thanh phan marginal (giam variance)")
+    ap.add_argument("--fixed_ref", action="store_true",
+                    help="metric CU: chi marginal-removal. Mac dinh la KY VONG tren reference set "
+                         "{zero, mean, mask, pad, mean+noise} + marginal.")
+    ap.add_argument("--n_refs", type=int, default=None, help="cat bot reference set")
+    ap.add_argument("--ref_noise", type=float, nargs="+", default=[0.5, 1.0],
+                    help="cac muc sd cho reference mean+noise (nhan std tung chieu, CO DINH theo seed)")
+    ap.add_argument("--no_ref_marginal", action="store_true",
+                    help="bo thanh phan marginal (rut embedding THAT) khoi reference set")
     ap.add_argument("--rivals", action="store_true", help="bat IG2 / Max-Entropy / FRInGe")
     ap.add_argument("--ig2_steps", type=int, default=40)
     ap.add_argument("--me_steps", type=int, default=100)
@@ -257,6 +265,123 @@ def diffusion_ig_embedding(fwd, model, word_embed, ref, position_embed, type_emb
     return attr_token, attr_full
 
 
+# ---------------------------------------------------------------------------
+# NLP: REFERENCE SET cho metric ky vong.
+#   zero / mean (trung binh embedding cua ref_pool) / [MASK] / [PAD] / noise co dinh
+# Ly do: chi dung MOT gia tri thay the (vd [MASK]) se thien vi IG-mask, vi token bi
+# xoa duoc thay bang chinh baseline cua method do. Trung binh tren nhieu reference
+# moi la measure dung.
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def make_reference_set_nlp(ref_pool, mask_emb=None, pad_emb=None,
+                           noise_stds=(0.5, 1.0), n_refs=None, seed=0):
+    """
+    Tra ve (names, refs) — refs: list vector (d,), dung lam gia tri thay the 1 token.
+    mask_emb/pad_emb = None (tokenizer khong co) thi BO QUA reference do.
+    """
+    dev, dt = ref_pool.device, ref_pool.dtype
+    mu = ref_pool.mean(0)
+    sd = ref_pool.std(0).clamp_min(1e-8)
+    g = torch.Generator(device="cpu").manual_seed(seed)
+
+    names = ["zero", "mean"]
+    refs = [torch.zeros_like(mu), mu.clone()]
+    if mask_emb is not None:
+        names.append("mask"); refs.append(mask_emb.to(device=dev, dtype=dt).reshape(-1))
+    if pad_emb is not None:
+        names.append("pad"); refs.append(pad_emb.to(device=dev, dtype=dt).reshape(-1))
+    for s_ in noise_stds:
+        eps = torch.randn(mu.shape, generator=g).to(device=dev, dtype=dt) * s_ * sd
+        names.append(f"mean+noise{s_}"); refs.append(mu + eps)
+
+    if n_refs is not None:
+        names, refs = names[:n_refs], refs[:n_refs]
+    return names, refs
+
+
+@torch.no_grad()
+def insdel_ref_nlp(fwd, model, word_embed, position_embed, type_embed,
+                   attention_mask, attr_token, pred_class, ref_vec, keep_tok):
+    """
+    I-D voi MOT reference CO DINH ref_vec (d,): xoa token = dat embedding ve ref_vec.
+    Tra ve (ins_auc, del_auc, id_gap). Deterministic, khong can n_draw.
+    """
+    dev = word_embed.device
+    tok_idx = keep_tok.nonzero().flatten()
+    n = tok_idx.numel()
+    if n == 0:
+        return float("nan"), float("nan"), float("nan")
+    a = attr_token[tok_idx].abs()
+    order = tok_idx[torch.argsort(a, descending=True)]
+    rv = ref_vec.to(device=dev, dtype=word_embed.dtype).reshape(-1)
+
+    def prob(emb):
+        lg = fwd(model, emb, attention_mask=attention_mask,
+                 position_embed=position_embed, type_embed=type_embed)
+        return torch.softmax(lg, -1)[0, pred_class].item()
+
+    base = word_embed.clone(); base[0, order] = rv
+    cur = word_embed.clone(); dele = [prob(cur)]
+    for pos in order:
+        cur[0, pos] = rv; dele.append(prob(cur))
+    cur = base.clone(); ins = [prob(cur)]
+    for pos in order:
+        cur[0, pos] = word_embed[0, pos]; ins.append(prob(cur))
+
+    _trap = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+    ins_auc = float(_trap(ins) / (len(ins) - 1))
+    del_auc = float(_trap(dele) / (len(dele) - 1))
+    return ins_auc, del_auc, ins_auc - del_auc
+
+
+@torch.no_grad()
+def insdel_expected_nlp(fwd, model, word_embed, position_embed, type_embed,
+                        attention_mask, attr_token, pred_class, keep_tok,
+                        refs, ref_names=None, ref_pool=None, marginal=True,
+                        n_draw=8, seed=0):
+    """
+    MEASURE CHINH (nlp): ky vong I-D tren PHAN PHOI reference.
+      refs      : list vector (d,) tu make_reference_set_nlp  (zero/mean/mask/pad/noise)
+      marginal  : neu True, THEM mot thanh phan 'marginal' = rut embedding THAT tu
+                  ref_pool (expectation-over-data), trung binh n_draw lan.
+    Tra ve dict co mean + std TREN CAC REFERENCE. std lon => thu hang lat theo
+    reference; do la ket qua, khong phai nhieu.
+    """
+    if ref_names is None:
+        ref_names = [f"ref{i}" for i in range(len(refs))]
+
+    ins_l, del_l, per_ref = [], [], {}
+    for nm, rv in zip(ref_names, refs):
+        i_, d_, g_ = insdel_ref_nlp(fwd, model, word_embed, position_embed, type_embed,
+                                    attention_mask, attr_token, pred_class, rv, keep_tok)
+        if not np.isnan(g_):
+            ins_l.append(i_); del_l.append(d_)
+            per_ref[nm] = {"ins": i_, "del": d_, "id_gap": g_}
+
+    if marginal and ref_pool is not None:
+        i_, d_, g_ = insdel_marginal_nlp(fwd, model, word_embed, position_embed, type_embed,
+                                         attention_mask, attr_token, pred_class,
+                                         ref_pool=ref_pool, keep_tok=keep_tok,
+                                         n_draw=n_draw, seed=seed)
+        if not np.isnan(g_):
+            ins_l.append(i_); del_l.append(d_)
+            per_ref["marginal"] = {"ins": i_, "del": d_, "id_gap": g_}
+
+    if not ins_l:
+        return {"insertion_auc": float("nan"), "deletion_auc": float("nan"),
+                "id_gap": float("nan"), "insertion_std": float("nan"),
+                "deletion_std": float("nan"), "id_gap_std": float("nan"),
+                "n_refs": 0, "per_ref": {}}
+
+    ins = np.array(ins_l); dele = np.array(del_l); gap = ins - dele
+    _sd = (lambda v: float(v.std(ddof=1)) if v.size > 1 else 0.0)
+    return {"insertion_auc": float(ins.mean()), "insertion_std": _sd(ins),
+            "deletion_auc": float(dele.mean()), "deletion_std": _sd(dele),
+            "id_gap": float(gap.mean()), "id_gap_std": _sd(gap),
+            "n_refs": int(ins.size), "ref_names": list(per_ref.keys()),
+            "per_ref": per_ref}
+
+
 @torch.no_grad()
 def insdel_marginal_nlp(fwd, model, word_embed, position_embed, type_embed,
                         attention_mask, attr_token, pred_class, ref_pool,
@@ -392,6 +517,19 @@ def main():
     # khong co mask_token (hiem), fallback ve pad.
     _mask_id = tokenizer.mask_token_id if tokenizer.mask_token_id is not None else tokenizer.pad_token_id
     mask_emb_single = embed(torch.tensor([[_mask_id]], device=device))[0, 0]                # (d,)
+
+    # --- REFERENCE SET cho metric ky vong (dung CHUNG cho moi method) ---
+    # mask CHI them khi tokenizer that su co mask_token; neu khong, no trung pad -> bo di
+    # de khong dem trung mot reference hai lan.
+    _has_mask = tokenizer.mask_token_id is not None
+    _ref_names_nlp, _refs_nlp = make_reference_set_nlp(
+        X_ref,
+        mask_emb=(mask_emb_single if _has_mask else None),
+        pad_emb=(pad_emb_single if tokenizer.pad_token_id is not None else None),
+        noise_stds=tuple(args.ref_noise), n_refs=args.n_refs, seed=args.seed)
+    print(f"[i] METRIC = ky vong I-D tren {len(_refs_nlp)} reference: {_ref_names_nlp}"
+          + ("" if args.no_ref_marginal else " (+marginal)")
+          + ("   [--fixed_ref: DANG dung metric cu, chi marginal]" if args.fixed_ref else ""))
     # S(X,y,0) cua soft_faith = "zeroed out sequence" (Eq.1 Zhao-Aletras 2023), KHONG phai
     # PAD, KHONG phai mu. Day chi la HANG SO CHUAN HOA per-cau (mau so 1-S(X,y,0)), giong
     # nhau cho MOI method tren cung 1 cau -> de base_token_emb=None de soft_faith tu tao
@@ -718,20 +856,34 @@ def main():
             acc[nm]["soft_ns"].append(ns)
             acc[nm]["soft_logodds"].append(lo)
 
-            # --- MARGINAL-REMOVAL insertion/deletion (khop tabular/image) ---
-            # xoa token = thay embedding bang embedding THAT tu X_ref (in-distribution).
-            # KHONG tai dung baseline. Metric nay doc lap voi bt, dau ro rang.
-            m_ins, m_del, m_gap = insdel_marginal_nlp(
-                fwd, model, word_embed, position_embed, type_embed, attn,
-                attr_token, pred_class, ref_pool=X_ref, keep_tok=keep_tok,
-                n_draw=args.md_ndraw, seed=args.seed)
+            # --- insertion/deletion KY VONG tren REFERENCE SET ---
+            # {zero, mean, mask, pad, mean+noise} (+ marginal = embedding THAT tu X_ref).
+            # KHONG mot gia tri thay the co dinh nao: neu chi dung [MASK] thi IG-mask
+            # duoc cham bang chinh baseline cua no.
+            _row = {"idx": si, "method": nm, "soft_nc": nc, "soft_ns": ns, "soft_logodds": lo}
+            if args.fixed_ref:
+                m_ins, m_del, m_gap = insdel_marginal_nlp(
+                    fwd, model, word_embed, position_embed, type_embed, attn,
+                    attr_token, pred_class, ref_pool=X_ref, keep_tok=keep_tok,
+                    n_draw=args.md_ndraw, seed=args.seed)
+            else:
+                _r = insdel_expected_nlp(
+                    fwd, model, word_embed, position_embed, type_embed, attn,
+                    attr_token, pred_class, keep_tok=keep_tok,
+                    refs=_refs_nlp, ref_names=_ref_names_nlp, ref_pool=X_ref,
+                    marginal=(not args.no_ref_marginal),
+                    n_draw=args.md_ndraw, seed=args.seed)
+                m_ins, m_del, m_gap = _r["insertion_auc"], _r["deletion_auc"], _r["id_gap"]
+                _row.update({"md_ins_std": _r["insertion_std"], "md_del_std": _r["deletion_std"],
+                             "md_idgap_std": _r["id_gap_std"], "n_refs": _r["n_refs"]})
+                for _rn, _rv in _r["per_ref"].items():
+                    _row[f"id_gap[{_rn}]"] = _rv["id_gap"]
             acc[nm]["md_ins"].append(m_ins)
             acc[nm]["md_del"].append(m_del)
             acc[nm]["md_idgap"].append(m_gap)
 
-            per_rows.append({"idx": si, "method": nm, "soft_nc": nc, "soft_ns": ns,
-                             "soft_logodds": lo, "md_ins": m_ins, "md_del": m_del,
-                             "md_idgap": m_gap})
+            _row.update({"md_ins": m_ins, "md_del": m_del, "md_idgap": m_gap})
+            per_rows.append(_row)
 
         if (si + 1) % 5 == 0 or si + 1 == len(sample):
             print(f"[{si+1}/{len(sample)}] done")

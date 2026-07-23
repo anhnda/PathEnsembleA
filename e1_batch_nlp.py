@@ -881,6 +881,10 @@ def main():
                 m_ins, m_del, m_gap = _r["insertion_auc"], _r["deletion_auc"], _r["id_gap"]
                 _row.update({"md_ins_std": _r["insertion_std"], "md_del_std": _r["deletion_std"],
                              "md_idgap_std": _r["id_gap_std"], "n_refs": _r["n_refs"]})
+                # spread GIUA cac reference (khac han bootstrap-SE giua cac CAU)
+                acc[nm].setdefault("md_refstd", []).append(_r["id_gap_std"])
+                acc[nm].setdefault("md_perref", []).append(
+                    {k: v["id_gap"] for k, v in _r["per_ref"].items()})
                 for _rn, _rv in _r["per_ref"].items():
                     _row[f"id_gap[{_rn}]"] = _rv["id_gap"]
             acc[nm]["md_ins"].append(m_ins)
@@ -1020,15 +1024,47 @@ def main():
     # Doc lap voi baseline, dau ro rang, khop tabular/image. Xep hang theo I-D = ins - del.
     md_gap = {m: mean_se(acc[m]["md_idgap"])[0] for m in methods}
     best_md = max(md_gap, key=md_gap.get)
-    print(f"\n{'method':<20}{'MD-ins↑':>12}{'MD-del↓':>12}{'MD I-D↑':>14}")
-    print("-" * 58)
+    _has_ref = any(acc[m].get("md_refstd") for m in methods)
+    _hdr = f"\n{'method':<20}{'MD-ins↑':>12}{'MD-del↓':>12}{'MD I-D↑':>14}"
+    if _has_ref:
+        _hdr += f"{'ref-std':>10}"
+    print(_hdr)
+    print("-" * (68 if _has_ref else 58))
     for m in methods:
         i_m = mean_se(acc[m]["md_ins"])[0]
         d_m = mean_se(acc[m]["md_del"])[0]
         g_m, g_se = mean_se(acc[m]["md_idgap"])
         mark = "  <-- best (marginal I-D)" if m == best_md else ""
-        print(f"{m:<20}{i_m:>12.4f}{d_m:>12.4f}{g_m:>8.4f}±{g_se:<5.4f}{mark}")
-    print("-" * 58)
+        _rs = acc[m].get("md_refstd")
+        _rstxt = f"{sum(_rs)/len(_rs):>10.4f}" if _rs else ("" if not _has_ref else f"{'-':>10}")
+        print(f"{m:<20}{i_m:>12.4f}{d_m:>12.4f}{g_m:>8.4f}±{g_se:<5.4f}{_rstxt}{mark}")
+    print("-" * (68 if _has_ref else 58))
+
+    # ---- I-D theo TUNG reference: thu hang co LAT khong? ----
+    if _has_ref:
+        _refnames = list(acc[methods[0]]["md_perref"][0].keys())
+        print(f"\n[i] I-D theo TUNG reference (trung binh {n} cau) — kiem tra thu hang co lat:")
+        print(f"{'method':<20}" + "".join(f"{rn:>14}" for rn in _refnames))
+        print("-" * (20 + 14 * len(_refnames)))
+        _per_ref_mean = {}
+        for m in methods:
+            row = {}
+            for rn in _refnames:
+                vals = [d[rn] for d in acc[m]["md_perref"] if rn in d]
+                row[rn] = sum(vals) / len(vals) if vals else float("nan")
+            _per_ref_mean[m] = row
+            print(f"{m:<20}" + "".join(f"{row[rn]:>14.4f}" for rn in _refnames))
+        print("-" * (20 + 14 * len(_refnames)))
+        _winners = {rn: max(methods, key=lambda mm: _per_ref_mean[mm][rn]) for rn in _refnames}
+        for rn in _refnames:
+            print(f"[i]   best@{rn:<16} = {_winners[rn]}")
+        _uniq = set(_winners.values())
+        if len(_uniq) > 1:
+            print(f"[!!] THU HANG LAT theo reference: {len(_uniq)} method khac nhau thang "
+                  f"({', '.join(sorted(_uniq))}).")
+            print(f"[!!]   => headline '{best_md}' chi la trung binh, KHONG on dinh. Bao cao ca bang nay.")
+        else:
+            print(f"[i] {best_md} thang tren MOI reference => thu hang ON DINH.")
     print(f"[i] MD I-D = insertion - deletion voi MARGINAL REMOVAL (thay token bang embedding")
     print(f"[i]   THAT tu reference pool, KHONG tai dung baseline). Metric nay khop tabular/image,")
     print(f"[i]   dau ro rang (cao=tot), doc lap voi bt. So sanh voi Soft-gap o bang tren.")

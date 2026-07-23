@@ -448,15 +448,19 @@ def _print_summary_table(metric_names, acc, id_per_image, n_img, title, bl_stren
                 knee_tab.append((sk[i_], fb_[i_], xh, yh, (1.0 - xh) - yh))
             knee_m = max(knee_tab, key=lambda r: r[4])[0]
 
+    _has_ref = any(acc[m].get("refstd") for m in metric_names)
     print(f"\n--- {title} (mean±SE tren {n_img} anh) ---")
-    print(f"{'method':<20}{'insertion↑':>16}{'deletion↓':>16}{'I-D↑':>16}{'win%':>7}"
+    print(f"{'method':<20}{'insertion↑':>16}{'deletion↓':>16}{'I-D↑':>16}"
+          + (f"{'ref-std':>10}" if _has_ref else "") + f"{'win%':>7}"
           f"{'f(x)':>8}{'f(b)':>8}{'Δf':>9}{'|b-x|₂':>10}{'Δf/|b-x|':>12}")
-    print("-" * 134)
+    print("-" * (144 if _has_ref else 134))
     for m in metric_names:
         im, ise = mean_se(acc[m]["ins"])
         dm, dse = mean_se(acc[m]["del"])
         idm, idse = mean_se(acc[m]["id"])
         winp = 100.0 * win_count[m] / n_img if n_img else 0.0
+        _rs = acc[m].get("refstd")
+        _rstxt = (f"{sum(_rs)/len(_rs):>10.4f}" if _rs else (f"{'-':>10}" if _has_ref else ""))
         # f(x)=p_full, f(xt)=p_base, ratio, shift |b-x| (EG khong co -> "-")
         # BON cot, giong het ca ba modality: f(x) f(b) Δf |b-x|₂
         fx, fxt, dftxt, stxt = "   -  ", "   -  ", "    -   ", "     -    "
@@ -474,9 +478,37 @@ def _print_summary_table(metric_names, acc, id_per_image, n_img, title, bl_stren
         if m == best_ratio:
             mark += "  <== max Δf/|b-x|"
         print(f"{m:<20}{im:>8.4f}±{ise:<6.4f}{dm:>8.4f}±{dse:<6.4f}{idm:>8.4f}±{idse:<6.4f}"
-              f"{winp:>6.1f}%{fx:>8}{fxt:>8}{dftxt:>9}{stxt:>10}{rtxt}{mark}")
-    print("-" * 134)
+              f"{_rstxt}{winp:>6.1f}%{fx:>8}{fxt:>8}{dftxt:>9}{stxt:>10}{rtxt}{mark}")
+    print("-" * (144 if _has_ref else 134))
     print(f"[i] dan dau I-D: {best_m} = {id_means[best_m]:.4f}")
+    if _has_ref:
+        print("[i] ref-std = do lech I-D GIUA cac reference (KHAC ±SE, la giua cac ANH).")
+        print("[i]   ref-std >= khoang cach giua cac method => thu hang KHONG on dinh.")
+        # --- I-D theo TUNG reference: thu hang co lat khong? ---
+        _mm = [m for m in metric_names if acc[m].get("perref")]
+        if _mm:
+            _rn = list(acc[_mm[0]]["perref"][0].keys())
+            print(f"\n[i] I-D theo TUNG reference (trung binh {n_img} anh):")
+            print(f"{'method':<20}" + "".join(f"{x:>13}" for x in _rn))
+            print("-" * (20 + 13 * len(_rn)))
+            _prm = {}
+            for m in _mm:
+                row = {}
+                for rn in _rn:
+                    v = [d[rn] for d in acc[m]["perref"] if rn in d]
+                    row[rn] = sum(v) / len(v) if v else float("nan")
+                _prm[m] = row
+                print(f"{m:<20}" + "".join(f"{row[rn]:>13.4f}" for rn in _rn))
+            print("-" * (20 + 13 * len(_rn)))
+            _win = {rn: max(_mm, key=lambda mm2: _prm[mm2][rn]) for rn in _rn}
+            for rn in _rn:
+                print(f"[i]   best@{rn:<14} = {_win[rn]}")
+            _u = set(_win.values())
+            if len(_u) > 1:
+                print(f"[!!] THU HANG LAT theo reference ({len(_u)} method thang: {', '.join(sorted(_u))}).")
+                print(f"[!!]   => '{best_m}' chi thang TRUNG BINH. Bao cao ca bang nay, khong chi headline.")
+            else:
+                print(f"[i] {best_m} thang tren MOI reference => thu hang ON DINH.")
     print("[i] Δf = f(x)-f(b) = do thay doi DAU RA.  |b-x|₂ = do thay doi DAU VAO (L2).")
     print("[i] Δf/|b-x| = DO THAY DOI DAU RA / DO THAY DOI DAU VAO. Mot TI SO, khong phai dao ham.")
     print("[i]   Tinh duoc cho MOI hang (ke ca black/blur/EG/IG2). Khong can K, khong can mu,")
@@ -781,6 +813,10 @@ def main():
                 _row.update({"insertion_std": r["insertion_std"],
                              "deletion_std": r["deletion_std"],
                              "id_gap_std": r["id_gap_std"], "n_refs": r["n_refs"]})
+                # spread GIUA cac reference (khac bootstrap-SE giua cac ANH)
+                acc[m].setdefault("refstd", []).append(r["id_gap_std"])
+                acc[m].setdefault("perref", []).append(
+                    {k: v["id_gap"] for k, v in r["per_ref"].items()})
                 # I-D theo TUNG reference -> kiem tra thu hang co lat khong
                 for _rn, _rv in r["per_ref"].items():
                     _row[f"id_gap[{_rn}]"] = _rv["id_gap"]

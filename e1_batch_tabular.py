@@ -590,10 +590,12 @@ def main():
             print(f"{nm:<20}{table[nm]['soft_nc']:>12.4f}{table[nm]['soft_ns']:>12.4f}"
                   f"{table[nm]['id_gap']:>12.4f}{scol}   ± {se:.4f}")
     else:
+        _show_ref = (not args.fixed_ref) and args.insdel_mode == "zero"
         print(f"{'method':<20}{'insertion↑':>12}{'deletion↓':>12}{'I-D↑':>10}"
-              f"{'f(x)':>8}{'f(b)':>8}{'Δf':>9}{'|b-x|₂':>10}{'P2':>6}"
+              + (f"{'ref-std':>10}" if _show_ref else "")
+              + f"{'f(x)':>8}{'f(b)':>8}{'Δf':>9}{'|b-x|₂':>10}{'P2':>6}"
               f"{'  (mean±SE[±seed-std])'}")
-        print("-" * 105)
+        print("-" * (115 if _show_ref else 105))
         # generator reset theo INPUT i (seed = args.seed + 7 + i) — KHOP voi ORACLE loop.
         # Moi input luon thay DUNG CUNG mau marginal o moi method => so sanh cong bang,
         # va ORACLE thuc su la TRAN TREN (khong con overfit vao noise cua mot lan boc).
@@ -632,11 +634,23 @@ def main():
                          "n_refs": len(_ref_names_tab)}
             tail = f"   ± {se:.4f}" + (f"  [seed-std {seed_std:.4f}, n={len(seeds)}]" if len(seeds) > 1 else "")
             scol = _fmt_strength(bl_str.get(nm))
+            rcol = f"{table[nm]['ref_std']:>10.4f}" if _show_ref else ""
             print(f"{nm:<20}{table[nm]['insertion']:>12.4f}{table[nm]['deletion']:>12.4f}"
-                  f"{table[nm]['id_gap']:>10.4f}{scol}{tail}")
+                  f"{table[nm]['id_gap']:>10.4f}{rcol}{scol}{tail}")
 
     gap_label = "Soft-gap" if args.metric == "soft" else "I-D"
     print("-" * 68)
+    if args.metric == "insdel":
+        if args.fixed_ref:
+            print(f"[i] METRIC: 1 reference co dinh (--fixed_ref), mode={args.insdel_mode}.")
+        elif args.insdel_mode != "zero":
+            print(f"[!!] --insdel_mode={args.insdel_mode}: gia tri thay the do MODE quyet dinh, "
+                  f"reference set {_ref_names_tab} KHONG duoc dung.")
+            print(f"[!!]   Muon KY VONG tren reference set => them --insdel_mode zero.")
+        else:
+            print(f"[i] METRIC = ky vong I-D tren {len(_ref_names_tab)} reference: {_ref_names_tab}")
+            print(f"[i]   ref-std = do lech GIUA cac reference (KHAC ±SE, la giua cac MAU).")
+            print(f"[i]   ref-std >= khoang cach giua cac method => thu hang KHONG on dinh.")
     best = max(table, key=lambda k: table[k]["id_gap"])
 
     # ---- SANITY: Adaptive-oracle PHAI la tran tren cua moi Shrinkage-* ----
